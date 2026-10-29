@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { lstat, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveFolderAccount } from "../auth/folderAuth.js";
 import { planFolderCreates } from "../notes/folderCreate.js";
@@ -47,7 +47,7 @@ import { classifyNoteRecord, storesTextAsAsset, TEXT_AS_ASSET_REASON, type NoteD
 import { CorruptStateFileError, NotClonedDirectoryError, NotesUnavailableError } from "../errors.js";
 import { buildNoteCreateFields, buildNoteMoveFields, buildNoteTrashFields, buildNoteUpdateFields } from "../notes/encodeNoteRecord.js";
 import { noteDirOf, stateDirIndex, type StateDirInfo } from "../notes/folderLayout.js";
-import { planEmbedRepresentations, type NewAttachmentLink } from "../notes/embedPushEdit.js";
+import { hasVaultEmbed, planEmbedRepresentations, type NewAttachmentLink, type VaultFiles } from "../notes/embedPushEdit.js";
 import { isEnoent } from "../fsUtil.js";
 import { hasConflictMarkers, mergeNoteVersions } from "../notes/mergeConflict.js";
 import { decodeNoteEmbedSlots, hasAttachmentReference, OBJECT_REPLACEMENT_CHARACTER, type EmbedSlot } from "../notes/noteAttachments.js";
@@ -193,8 +193,11 @@ interface PreparedCandidate {
 interface PreparedNewAttachment {
   attachmentRecordName: string;
   mediaRecordName: string;
-  /** Vault-relative path of the local file. */
+  /** Vault-relative path of the local file (where it lives once pushed). */
   file: string;
+  /** Where the file is now, when that isn't `file`: an Obsidian-style
+   * embed's file, moved into the note's attachments/ once it's uploaded. */
+  moveFrom?: string | undefined;
   bytes: Uint8Array;
   /** The link as the user wrote it, and as pull will render it from now on. */
   linkText: string;
@@ -710,6 +713,11 @@ export async function buildPushPlan(
   // attachment, as pull lays them out: if two notes shared one, a later pull
   // removing the image from either would delete the file the other uses.
   const claimedAttachmentFiles = new Set(Object.values(state.attachments ?? {}).map((attachment) => attachment.file));
+  // Every non-note file in the vault, so an Obsidian-style embed
+  // (`![[Pasted image.png]]`, or a markdown link to a file outside
+  // `attachments/`) can be recognised as a new attachment.
+  const vaultFiles = await listVaultFiles(targetDir);
+  const vaultFilesFor = (noteFile: string): VaultFiles => ({ noteDir: posixDirname(noteFile), files: vaultFiles });
   const createCandidates: { file: string; localText: string; folderRecordName: string; sharedZoneOwner?: string | undefined }[] = [];
   for (const { file, localText } of untracked) {
     if (claimedByMove.has(file) || refusedByIdClaim.has(file)) {
@@ -793,7 +801,7 @@ export async function buildPushPlan(
       });
       continue;
     }
-    if (hasAttachmentReference(localText) && info.sharedZoneOwner !== undefined) {
+    if ((hasAttachmentReference(localText) || hasVaultEmbed(localText, vaultFilesFor(file))) && info.sharedZoneOwner !== undefined) {
       entries.push({
         kind: "create",
         file,
@@ -1112,8 +1120,8 @@ export async function buildPushPlan(
     const recordName = randomUUID();
     let newAttachments: ResolvedNewAttachment[] = [];
     let sourceText = localText;
-    if (hasAttachmentReference(localText)) {
-      const plan = planEmbedRepresentations(localText, [], new Set(), new Map());
+    if (hasAttachmentReference(localText) || hasVaultEmbed(localText, vaultFilesFor(file))) {
+      const plan = planEmbedRepresentations(localText, [], new Set(), new Map(), vaultFilesFor(file));
       if (!plan.ok) {
         entries.push({ kind: "create", file, resolution: "refused", reason: plan.reason });
         continue;
@@ -1268,6 +1276,7 @@ export async function buildPushPlan(
           folderRecordName,
           sharedZoneOwner,
         };
+        const moveProblems = await moveEmbeddedFiles(targetDir, newAttachments);
         // New image links take the exact form pull renders, so the next push
         // matches them as this note's existing attachments.
         await writeBaseCopy(targetDir, recordName, canonicalizeNewLinks(localText, newAttachments));
@@ -1294,7 +1303,7 @@ export async function buildPushPlan(
           });
         }
         await recordEpoch(targetDir, recordName, historyRecordNames(state, recordName));
-        return { succeeded: true, message: `Created ${file}` };
+        return { succeeded: true, message: `Created ${file}${moveProblems.map((problem) => ` (${problem})`).join("")}` };
       },
     });
   }
@@ -1415,6 +1424,7 @@ export async function buildPushPlan(
       titleMode,
       summary,
       requestedTitle,
+      vaultFilesFor(entry.file),
     );
     if (!prepared) {
       const newConflict = summary.conflicts[conflictsBefore];
@@ -1514,6 +1524,7 @@ export async function buildPushPlan(
           }
         }
         let syncedText = localText;
+        let moveProblems: string[] = [];
         if (prepared.newAttachments && prepared.newAttachments.length > 0) {
           state.attachments ??= {};
           for (const attachment of prepared.newAttachments) {
@@ -1530,6 +1541,7 @@ export async function buildPushPlan(
               noteRecordName: recordName,
             };
           }
+          moveProblems = await moveEmbeddedFiles(targetDir, prepared.newAttachments);
           // Rewrite each new link to the exact form pull renders, so the next
           // push matches it as this attachment's link rather than a new one.
           syncedText = canonicalizeNewLinks(localText, prepared.newAttachments);
@@ -1544,7 +1556,7 @@ export async function buildPushPlan(
         // `pull`'s own capture - see the "Whole-note coordinated version
         // epochs" investigation.
         await recordEpoch(targetDir, recordName, historyRecordNames(state, recordName));
-        return { succeeded: true, message: `Pushed ${entry.file}` };
+        return { succeeded: true, message: `Pushed ${entry.file}${moveProblems.map((problem) => ` (${problem})`).join("")}` };
       },
     });
   }
@@ -1689,6 +1701,7 @@ async function prepareUpdate(
   titleMode: TitleMode,
   summary: PushSummary,
   requestedTitle?: string | undefined,
+  vaultFiles?: VaultFiles | undefined,
 ): Promise<PreparedCandidate | undefined> {
   // The mode has to reach the classifier, not just this function: it decides
   // whether `markdownText` (which the local file is a copy of) omits the
@@ -1716,7 +1729,7 @@ async function prepareUpdate(
     return undefined;
   }
 
-  if (classified.embedSlots.length > 0 || hasAttachmentReference(localText)) {
+  if (classified.embedSlots.length > 0 || hasAttachmentReference(localText) || hasVaultEmbed(localText, vaultFiles)) {
     return prepareEmbedCandidate(
       session,
       ckdatabasewsUrl,
@@ -1732,6 +1745,7 @@ async function prepareUpdate(
       modificationDateMs,
       summary,
       requestedTitle,
+      vaultFiles,
     );
   }
 
@@ -1790,12 +1804,14 @@ async function prepareEmbedCandidate(
   modificationDateMs: number,
   summary: PushSummary,
   requestedTitle?: string | undefined,
+  vaultFiles?: VaultFiles | undefined,
 ): Promise<PreparedCandidate | undefined> {
   const plan = planEmbedRepresentations(
     localText,
     classified.embedSlots,
     new Set(trackedFileAttachmentIds.keys()),
     trackedFileAttachmentIds,
+    vaultFiles,
   );
   if (!plan.ok) {
     summary.refused.push(`${entry.file}: ${plan.reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
@@ -2070,19 +2086,114 @@ export function prepareNoteCreate(
   return { ok: true, payloadBase64: compressed.toString("base64"), plainText: desired.text };
 }
 
+/** POSIX directory of a vault-relative file ("" at the vault root). */
+function posixDirname(file: string): string {
+  const dir = path.posix.dirname(file.split(path.sep).join("/"));
+  return dir === "." ? "" : dir;
+}
+
+/** Every non-note file under the vault, as vault-relative POSIX paths -
+ * skipping dot-directories (.icloud-md, .obsidian, .git, .trash). */
+async function listVaultFiles(targetDir: string): Promise<Set<string>> {
+  const files = new Set<string>();
+  const walk = async (relative: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(path.join(targetDir, relative), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) {
+        continue;
+      }
+      const child = relative === "" ? entry.name : `${relative}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await walk(child);
+      } else if (entry.isFile() && !entry.name.toLowerCase().endsWith(".md")) {
+        files.add(child);
+      }
+    }
+  };
+  await walk("");
+  return files;
+}
+
+/** A name in `dir` that no file has and no other new attachment is about to
+ * take: `name`, else `name 2`, `name 3`, ... before the extension. */
+async function freeAttachmentPath(targetDir: string, dir: string, name: string, taken: ReadonlySet<string>): Promise<string> {
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const extension = dot > 0 ? name.slice(dot) : "";
+  for (let n = 1; ; n += 1) {
+    const candidate = `${dir}/${n === 1 ? name : `${stem} ${n}${extension}`}`;
+    if (taken.has(candidate)) {
+      continue;
+    }
+    try {
+      await lstat(path.join(targetDir, candidate));
+    } catch {
+      return candidate;
+    }
+  }
+}
+
+/**
+ * After a successful push, moves each Obsidian-embedded file into the
+ * attachments/ folder its link now points at. A failed move leaves the file
+ * where it was (and pull re-downloads the attachment to its tracked path),
+ * so it never loses data - it's reported, not fatal.
+ */
+async function moveEmbeddedFiles(targetDir: string, attachments: readonly PreparedNewAttachment[]): Promise<string[]> {
+  const problems: string[] = [];
+  for (const attachment of attachments) {
+    if (attachment.moveFrom === undefined) {
+      continue;
+    }
+    const to = path.join(targetDir, attachment.file);
+    try {
+      await mkdir(path.dirname(to), { recursive: true });
+      try {
+        await lstat(to);
+        problems.push(`${attachment.file} already exists; left ${attachment.moveFrom} where it was`);
+        continue;
+      } catch {
+        // free - move into place
+      }
+      try {
+        await rename(path.join(targetDir, attachment.moveFrom), to);
+      } catch {
+        await copyFile(path.join(targetDir, attachment.moveFrom), to);
+      }
+    } catch (cause) {
+      problems.push(`couldn't move ${attachment.moveFrom} to ${attachment.file}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  }
+  return problems;
+}
+
 /** Claims each new image's file, or returns the first one that's taken. */
-export function takeAttachmentFiles(claimed: Set<string>, attachments: readonly { file: string }[]): string | undefined {
+export function takeAttachmentFiles(
+  claimed: Set<string>,
+  attachments: readonly { file: string; moveFrom?: string | undefined }[],
+): string | undefined {
   // Checked against a copy first, so a refused note claims nothing - and the
-  // same new file linked twice in one note is caught too.
+  // same new file linked twice in one note is caught too. A file that's
+  // about to move claims both where it is and where it's going.
   const next = new Set(claimed);
   for (const attachment of attachments) {
-    if (next.has(attachment.file)) {
-      return attachment.file;
+    for (const file of [attachment.file, attachment.moveFrom]) {
+      if (file === undefined) {
+        continue;
+      }
+      if (next.has(file)) {
+        return file;
+      }
+      next.add(file);
     }
-    next.add(attachment.file);
   }
-  for (const attachment of attachments) {
-    claimed.add(attachment.file);
+  for (const file of next) {
+    claimed.add(file);
   }
   return undefined;
 }
@@ -2114,16 +2225,28 @@ async function resolveNewAttachments(
 ): Promise<ResolvedNewAttachment[] | undefined> {
   const noteDir = path.posix.dirname(noteFile.split(path.sep).join("/"));
   const resolved: ResolvedNewAttachment[] = [];
+  const plannedDestinations = new Set<string>();
   for (const link of links) {
-    const file = path.posix.normalize(path.posix.join(noteDir, link.href));
-    if (path.posix.isAbsolute(file) || file === ".." || file.startsWith("../")) {
+    const source = link.vaultPath ?? path.posix.normalize(path.posix.join(noteDir, link.href));
+    if (path.posix.isAbsolute(source) || source === ".." || source.startsWith("../")) {
       return refuse(`${link.linkText} points outside the vault`);
     }
+    // An Obsidian-style embed can name a file anywhere in the vault; once
+    // it's uploaded it moves into the note's own attachments/ folder, where
+    // pull keeps every attachment.
+    const attachmentsDir = noteDir === "." || noteDir === "" ? "attachments" : `${noteDir}/attachments`;
+    let file = source;
+    let moveFrom: string | undefined;
+    if (link.vaultPath !== undefined && path.posix.dirname(source) !== attachmentsDir) {
+      file = await freeAttachmentPath(targetDir, attachmentsDir, path.posix.basename(source), plannedDestinations);
+      moveFrom = source;
+    }
+    plannedDestinations.add(file);
     let info;
     try {
-      info = await lstat(path.join(targetDir, file));
+      info = await lstat(path.join(targetDir, source));
     } catch {
-      return refuse(`${link.linkText} points at a file that doesn't exist (${file})`);
+      return refuse(`${link.linkText} points at a file that doesn't exist (${source})`);
     }
     if (!info.isFile()) {
       return refuse(`${link.linkText} must point at a regular file, not a link or directory`);
@@ -2131,8 +2254,8 @@ async function resolveNewAttachments(
     if (info.size === 0 || info.size > MAX_NEW_ATTACHMENT_BYTES) {
       return refuse(`${link.linkText} is ${info.size === 0 ? "empty" : "larger than the 100 MB limit"}`);
     }
-    const bytes = new Uint8Array(await readFile(path.join(targetDir, file)));
-    const detected = detectFile(bytes, path.posix.basename(file));
+    const bytes = new Uint8Array(await readFile(path.join(targetDir, source)));
+    const detected = detectFile(bytes, path.posix.basename(source));
     if (!detected) {
       return refuse(`${link.linkText}: the file's contents don't match its extension`);
     }
@@ -2142,6 +2265,7 @@ async function resolveNewAttachments(
       attachmentRecordName,
       mediaRecordName: randomUUID().toUpperCase(),
       file,
+      moveFrom,
       bytes,
       linkText: link.linkText,
       canonicalLinkText: formatAttachmentMarkdown(

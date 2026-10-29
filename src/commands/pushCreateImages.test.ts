@@ -101,3 +101,14 @@ test("a new note can carry a non-image file, which keeps its plain-link placehol
   assert.equal(text, "Receipts\n\ufffc\n");
   assert.deepEqual(slots?.map((slot) => (slot.kind === "attachment" ? slot.ref.typeUti : slot.kind)), ["com.adobe.pdf"]);
 });
+
+test("a file about to move into attachments/ claims both its place and its destination", () => {
+  const claimed = new Set<string>();
+
+  assert.equal(takeAttachmentFiles(claimed, [{ file: "Notes/attachments/p.png", moveFrom: "p.png" }]), undefined);
+  assert.equal(
+    takeAttachmentFiles(claimed, [{ file: "Recipes/attachments/p.png", moveFrom: "p.png" }]),
+    "p.png",
+    "a second note embedding the same pasted file is refused - the first push moves it away",
+  );
+});

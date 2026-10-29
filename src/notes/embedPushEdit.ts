@@ -11,6 +11,7 @@
  * The network/fs orchestration lives in `src/commands/push.ts`.
  */
 
+import path from "node:path";
 import { findMarkdownTableBlocks, type MarkdownTableBlock } from "./markdownTable.js";
 import {
   formatAttachmentMarkdown,
@@ -54,9 +55,98 @@ export interface NewAttachmentLink {
   href: string;
   /** `![...](...)` rather than `[...](...)`. */
   isImage: boolean;
+  /** Set for an Obsidian-style embed - `![[file]]`, or a markdown link to a
+   * file outside `attachments/` - resolved against the vault's files: the
+   * vault-relative path of the file it names. `href` is unused then. */
+  vaultPath?: string | undefined;
+}
+
+/** The vault's non-note files, for resolving Obsidian-style embeds. */
+export interface VaultFiles {
+  /** The note's directory, vault-relative and POSIX ("" at the root). */
+  noteDir: string;
+  /** Every non-`.md` file in the vault, vault-relative POSIX paths. */
+  files: ReadonlySet<string>;
 }
 
 const ATTACHMENT_LINK_PATTERN = /(!?)\[[^\]\n]*\]\((attachments\/[^)\n]+)\)/g;
+const WIKI_EMBED_PATTERN = /!\[\[([^\]\n]+)\]\]/g;
+const MARKDOWN_LINK_PATTERN = /(!?)\[[^\]\n]*\]\(([^)\n]+)\)/g;
+
+/**
+ * Resolves an Obsidian link target to a vault file the way Obsidian does:
+ * a path is tried relative to the note, then from the vault root; a bare
+ * name is looked for beside the note, in its `attachments/`, and then
+ * anywhere in the vault - where it must be unique. `undefined` when nothing
+ * matches (the link stays literal text); "ambiguous" when a bare name
+ * matches several files.
+ */
+export function resolveVaultFile(target: string, vault: VaultFiles): string | "ambiguous" | undefined {
+  const clean = target.replace(/^\.\//, "");
+  const join = (dir: string, name: string) => path.posix.normalize(dir === "" ? name : `${dir}/${name}`);
+  if (clean.includes("/")) {
+    for (const candidate of [join(vault.noteDir, clean), path.posix.normalize(clean.replace(/^\/+/, ""))]) {
+      if (!candidate.startsWith("../") && vault.files.has(candidate)) {
+        return candidate;
+      }
+    }
+    return undefined;
+  }
+  for (const candidate of [join(vault.noteDir, clean), join(vault.noteDir, `attachments/${clean}`)]) {
+    if (vault.files.has(candidate)) {
+      return candidate;
+    }
+  }
+  const matches = [...vault.files].filter((file) => path.posix.basename(file) === clean);
+  return matches.length === 1 ? matches[0] : matches.length > 1 ? "ambiguous" : undefined;
+}
+
+interface VaultEmbed {
+  start: number;
+  end: number;
+  linkText: string;
+  isImage: boolean;
+  resolved: string | "ambiguous";
+}
+
+/** Obsidian-style embeds in `text` that name a real vault file. Links that
+ * resolve to nothing - URLs, other notes, missing files - aren't returned:
+ * they're ordinary text. */
+function findVaultEmbeds(text: string, vault: VaultFiles): VaultEmbed[] {
+  const found: VaultEmbed[] = [];
+  for (const match of text.matchAll(WIKI_EMBED_PATTERN)) {
+    // `![[name|alias]]`, `![[name#heading]]`: the file is the part before.
+    const target = (match[1] ?? "").split(/[|#]/)[0]?.trim() ?? "";
+    const resolved = target === "" ? undefined : resolveVaultFile(target, vault);
+    if (resolved !== undefined) {
+      found.push({ start: match.index, end: match.index + match[0].length, linkText: match[0], isImage: true, resolved });
+    }
+  }
+  for (const match of text.matchAll(MARKDOWN_LINK_PATTERN)) {
+    let href = (match[2] ?? "").trim();
+    // `[x](<path with spaces>)` and `[x](path "title")`.
+    href = href.startsWith("<") ? href.slice(1, href.indexOf(">") === -1 ? undefined : href.indexOf(">")) : (href.split(/\s+"/)[0] ?? "");
+    if (href.startsWith("attachments/") || href.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(href)) {
+      continue;
+    }
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(href);
+    } catch {
+      continue;
+    }
+    const resolved = resolveVaultFile(decoded, vault);
+    if (resolved !== undefined) {
+      found.push({ start: match.index, end: match.index + match[0].length, linkText: match[0], isImage: match[1] === "!", resolved });
+    }
+  }
+  return found.sort((a, b) => a.start - b.start);
+}
+
+/** Whether `text` has an Obsidian-style embed naming a real vault file. */
+export function hasVaultEmbed(text: string, vault: VaultFiles | undefined): boolean {
+  return vault !== undefined && findVaultEmbeds(text.replace(/\r\n?|\n/g, "\n"), vault).length > 0;
+}
 
 interface LocalRepresentation {
   /** Character range [start, end) in `localText` this representation spans. */
@@ -88,6 +178,9 @@ export function planEmbedRepresentations(
    * `attachmentInfo` run is never rewritten). Omitted, or missing an id,
    * keeps the read-only refusal for that attachment. */
   fileAttachmentLinkPaths: ReadonlyMap<string, string> = new Map(),
+  /** The vault's files, to recognise Obsidian-style embeds as new
+   * attachments. Omitted, only `attachments/...` links are. */
+  vaultFiles?: VaultFiles,
 ): EmbedRepresentationPlan {
   // Marker and table parsers use LF line positions. Normalize once before
   // discovery and splicing so every offset refers to the same string that
@@ -247,6 +340,28 @@ export function planEmbedRepresentations(
     }
     const link: NewAttachmentLink = { ordinal: -1, linkText: match[0], href, isImage: match[1] === "!" };
     combined.push({ start, end, newLink: link });
+  }
+  for (const embed of vaultFiles ? findVaultEmbeds(localText, vaultFiles) : []) {
+    if (combined.some((r) => embed.start < r.end && embed.end > r.start)) {
+      continue;
+    }
+    const lineStart = localText.lastIndexOf("\n", embed.start - 1) + 1;
+    const lineEndIndex = localText.indexOf("\n", embed.end);
+    const lineEnd = lineEndIndex === -1 ? localText.length : lineEndIndex;
+    if (localText.slice(lineStart, embed.start).trim() !== "" || localText.slice(embed.end, lineEnd).trim() !== "") {
+      return { ok: false, reason: `the embedded file ${embed.linkText} must be on a line of its own` };
+    }
+    if (embed.resolved === "ambiguous") {
+      return { ok: false, reason: `${embed.linkText} matches more than one file in the vault - link it by its path` };
+    }
+    const link: NewAttachmentLink = {
+      ordinal: -1,
+      linkText: embed.linkText,
+      href: "",
+      isImage: embed.isImage,
+      vaultPath: embed.resolved,
+    };
+    combined.push({ start: embed.start, end: embed.end, newLink: link });
   }
   combined.sort((a, b) => a.start - b.start);
   combined.forEach((representation, ordinal) => {

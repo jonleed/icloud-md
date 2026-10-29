@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { planEmbedRepresentations } from "./embedPushEdit.js";
+import { hasVaultEmbed, planEmbedRepresentations, resolveVaultFile } from "./embedPushEdit.js";
 import { renderMarkdownTable } from "./markdownTable.js";
 import { OBJECT_REPLACEMENT_CHARACTER, type EmbedSlot } from "./noteAttachments.js";
 import { formatEmbedMarker } from "./unknownContent.js";
@@ -307,4 +307,68 @@ test("mixed local separators normalize before locating multiple tables and marke
       [["TABLE-1", [["First", "Value"]]], ["TABLE-2", [["Second"]]]],
     );
   }
+});
+
+// --- Obsidian-style embeds ---------------------------------------------------
+
+const VAULT = {
+  noteDir: "Notes",
+  files: new Set([
+    "Pasted image 20261029.png",
+    "Notes/beside.jpg",
+    "Notes/attachments/inside.png",
+    "Assets/deep/scan.pdf",
+    "Recipes/dup.png",
+    "Travel/dup.png",
+  ]),
+};
+
+test("resolveVaultFile follows Obsidian's lookup: beside the note, attachments/, then a unique name anywhere", () => {
+  assert.equal(resolveVaultFile("beside.jpg", VAULT), "Notes/beside.jpg");
+  assert.equal(resolveVaultFile("inside.png", VAULT), "Notes/attachments/inside.png");
+  assert.equal(resolveVaultFile("Pasted image 20261029.png", VAULT), "Pasted image 20261029.png");
+  assert.equal(resolveVaultFile("Assets/deep/scan.pdf", VAULT), "Assets/deep/scan.pdf", "a vault-root path");
+  assert.equal(resolveVaultFile("../Assets/deep/scan.pdf", VAULT), "Assets/deep/scan.pdf", "a note-relative path");
+  assert.equal(resolveVaultFile("dup.png", VAULT), "ambiguous");
+  assert.equal(resolveVaultFile("missing.png", VAULT), undefined);
+  assert.equal(resolveVaultFile("../../outside.png", VAULT), undefined);
+});
+
+test("an Obsidian wikilink embed of a vault file becomes a new attachment; alias and heading are dropped", () => {
+  const plan = expectOk(
+    planEmbedRepresentations("T\n![[Pasted image 20261029.png]]\n![[scan.pdf|300]]\n", [], new Set(), new Map(), VAULT),
+  );
+  assert.equal(plan.reconstructedBodyText, `T\n${OBJECT_REPLACEMENT_CHARACTER}\n${OBJECT_REPLACEMENT_CHARACTER}\n`);
+  assert.deepEqual(
+    plan.newAttachments.map((link) => [link.ordinal, link.linkText, link.vaultPath, link.isImage]),
+    [
+      [0, "![[Pasted image 20261029.png]]", "Pasted image 20261029.png", true],
+      [1, "![[scan.pdf|300]]", "Assets/deep/scan.pdf", true],
+    ],
+  );
+});
+
+test("a markdown link to a vault file outside attachments/ becomes a new attachment too", () => {
+  const plan = expectOk(planEmbedRepresentations("T\n![](../Pasted%20image%2020261029.png)\n", [], new Set(), new Map(), VAULT));
+  assert.equal(plan.newAttachments[0]?.vaultPath, "Pasted image 20261029.png");
+});
+
+test("embeds that name no vault file stay literal text: URLs, notes, missing files", () => {
+  const text = "T\n![[Another note]]\n![[missing.png]]\n![x](https://example.com/a.png)\n[home](#top)\n";
+  const plan = expectOk(planEmbedRepresentations(text, [], new Set(), new Map(), VAULT));
+  assert.equal(plan.reconstructedBodyText, text);
+  assert.deepEqual(plan.newAttachments, []);
+});
+
+test("an ambiguous or inline Obsidian embed refuses the push", () => {
+  expectRefusal(planEmbedRepresentations("T\n![[dup.png]]\n", [], new Set(), new Map(), VAULT), /more than one file/);
+  expectRefusal(planEmbedRepresentations("T see ![[beside.jpg]] here\n", [], new Set(), new Map(), VAULT), /line of its own/);
+});
+
+test("without the vault's files, Obsidian embeds are plain text exactly as before", () => {
+  const plan = expectOk(planEmbedRepresentations("T\n![[beside.jpg]]\n", [], new Set(), new Map()));
+  assert.equal(plan.reconstructedBodyText, "T\n![[beside.jpg]]\n");
+  assert.equal(hasVaultEmbed("T\n![[beside.jpg]]\n", VAULT), true);
+  assert.equal(hasVaultEmbed("T\n![[missing.png]]\n", VAULT), false);
+  assert.equal(hasVaultEmbed("T\n![[beside.jpg]]\n", undefined), false);
 });
