@@ -3,7 +3,7 @@ import path from "node:path";
 import { isEnoent } from "../fsUtil.js";
 import { readBaseCopy } from "./baseCopy.js";
 import type { CloneStateNoteEntry, TitleMode } from "./cloneState.js";
-import { splitFrontmatter } from "./frontmatter.js";
+import { baseStartsBlank, splitFrontmatter } from "./frontmatter.js";
 
 /**
  * Whether a tracked note's local file still matches its base copy (the last
@@ -49,9 +49,11 @@ export async function readLocalNote(
   // filename-as-title a body can begin with a blank line, and splitting
   // without it folds that line into the envelope, so a freshly cloned note
   // never matches its base copy at all.
-  const { frontmatter, body } = splitFrontmatter(content, { filenameAsTitle: titleMode === "filename" });
-
   const base = await readBaseCopy(targetDir, recordName);
+  const { frontmatter, body } = splitFrontmatter(content, {
+    filenameAsTitle: titleMode === "filename",
+    bodyStartsBlank: baseStartsBlank(base),
+  });
   if (base === undefined) {
     // No base copy on disk for a tracked note shouldn't normally happen, but
     // if it does, we can't verify cleanliness - treat conservatively.

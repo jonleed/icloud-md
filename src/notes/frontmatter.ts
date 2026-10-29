@@ -52,6 +52,22 @@ export interface SplitFrontmatterOptions {
    * `splitFrontmatter`.
    */
   filenameAsTitle?: boolean;
+  /**
+   * The note's body is known to open with a blank line - its base copy (the
+   * last-synced remote body) does. Folds exactly the one separator line
+   * `joinFrontmatter` writes instead of every blank line, for the same reason
+   * `filenameAsTitle` does: in an in-body vault a note whose title paragraph
+   * is empty has a body that genuinely starts blank, and greedy folding ate
+   * those lines - the note read as modified from clone and a push deleted
+   * them from the live note. Callers derive it with `baseStartsBlank`.
+   */
+  bodyStartsBlank?: boolean;
+}
+
+/** Whether a base copy says the note's body starts with a blank line - the
+ * value for `SplitFrontmatterOptions.bodyStartsBlank`. */
+export function baseStartsBlank(base: string | undefined): boolean {
+  return base !== undefined && base.startsWith("\n");
 }
 
 /**
@@ -111,7 +127,7 @@ export function splitFrontmatter(text: string, options: SplitFrontmatterOptions 
   // blank lines a user left under their frontmatter stay cosmetic rather than
   // becoming empty paragraphs pushed to the top of the note.
   let envelopeEnd = closingFence;
-  if (options.filenameAsTitle === true) {
+  if (options.filenameAsTitle === true || options.bodyStartsBlank === true) {
     if (lines[envelopeEnd + 1] === "") {
       envelopeEnd += 1;
     }

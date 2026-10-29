@@ -157,3 +157,33 @@ test("an in-body vault still folds every blank line under the envelope", () => {
 
   assert.equal(split.body, "My Note\nBody");
 });
+
+test("an in-body note whose title paragraph is empty keeps its leading blank lines when the base copy starts blank", () => {
+  // The in-body counterpart of the filename-as-title bug: a note whose first
+  // line is empty (Apple allows it; the list shows the first non-empty line)
+  // has a body that genuinely opens with blank lines. Greedy folding ate
+  // them, so the note read as modified right after clone and a plain push
+  // deleted the blank lines from the live note.
+  const body = "\n\ndress in a characters color platte\n";
+  const text = joinFrontmatter("---\napple-note-id: 8391F44B-E178-47E5-9AC2-2F36FBA0183F\n---\n\n", body);
+
+  const split = splitFrontmatter(text, { bodyStartsBlank: true });
+
+  assert.equal(split.body, body);
+  assert.equal(split.frontmatter + split.body, text);
+});
+
+test("bodyStartsBlank folds exactly the one separator joinFrontmatter writes", () => {
+  const envelope = "---\nx: 1\n---\n\n";
+  for (const body of ["\n", "\n\n\nthree blank lines", "\nTitle on line two", "No blank line"]) {
+    const split = splitFrontmatter(joinFrontmatter(envelope, body), { bodyStartsBlank: true });
+    assert.equal(split.body, body, `round trip lost content for: ${JSON.stringify(body)}`);
+    assert.equal(split.frontmatter, envelope);
+  }
+  // An envelope with no separator line at all (as some editors write it).
+  assert.equal(splitFrontmatter("---\nx: 1\n---\nbody", { bodyStartsBlank: true }).body, "body");
+});
+
+test("bodyStartsBlank has no effect on files without frontmatter", () => {
+  assert.equal(splitFrontmatter("\n\nbody", { bodyStartsBlank: true }).body, "\n\nbody");
+});

@@ -22,7 +22,7 @@ import { NotClonedDirectoryError, NotesUnavailableError } from "../errors.js";
 import { isEnoent } from "../fsUtil.js";
 import { claimFreeFileName, fileNameCarriesTitle, noteFileNameFor, titleNeedingFrontmatter } from "../notes/filename.js";
 import { representabilityProblem } from "../notes/titleFilename.js";
-import { joinFrontmatter, splitFrontmatter } from "../notes/frontmatter.js";
+import { baseStartsBlank, joinFrontmatter, splitFrontmatter } from "../notes/frontmatter.js";
 import { buildVaultLayout, noteDirOf, placeNote, previousLayoutDirs, type SharedZoneRecords } from "../notes/folderLayout.js";
 import { reconcileNotePlacements, removeStaleDirs } from "../notes/folderReconcile.js";
 import { hasConflictMarkers, mergeNoteVersions } from "../notes/mergeConflict.js";
@@ -600,7 +600,12 @@ export async function runPull(
           // file has none to keep); the base copy stays body-only.
           const frontmatter =
             local === "clean"
-              ? splitFrontmatter(await readFile(filePath, "utf-8"), { filenameAsTitle: titleMode === "filename" }).frontmatter
+              ? splitFrontmatter(await readFile(filePath, "utf-8"), {
+                  filenameAsTitle: titleMode === "filename",
+                  // "clean" means the body matched the base copy split this
+                  // same way; the envelope has to end where that body began.
+                  bodyStartsBlank: baseStartsBlank(await readBaseCopy(targetDir, record.recordName)),
+                }).frontmatter
               : "";
           // Also the self-healing path for an id: a file whose envelope was
           // stripped (by hand, or by an older build's `restore`) gets it back
@@ -1165,6 +1170,7 @@ async function handleRemoteDeletion(
   const base = (await readBaseCopy(targetDir, record.recordName)) ?? "";
   const { frontmatter, body: localContent } = splitFrontmatter(await readFile(path.join(targetDir, existing.file), "utf-8"), {
     filenameAsTitle: titleMode === "filename",
+    bodyStartsBlank: baseStartsBlank(base),
   });
   const outcome = mergeNoteVersions(base, localContent, "");
 
@@ -1256,6 +1262,7 @@ export async function mergeRemoteChangeIntoLocalFile(
   const base = (await readBaseCopy(targetDir, recordName)) ?? "";
   const { frontmatter, body: localContent } = splitFrontmatter(await readFile(path.join(targetDir, file), "utf-8"), {
     filenameAsTitle: titleMode === "filename",
+    bodyStartsBlank: baseStartsBlank(base),
   });
   if (hasConflictMarkers(localContent)) {
     // Diff3 over text that already carries conflict markers nests markers
@@ -1384,8 +1391,10 @@ export async function mergeRemoteChangeIntoMovedFile(
   { previousTitle, remoteTitle, titleMode = "in-body" }: MovedFileTitles,
 ): Promise<{ status: "updated" | "merged" | "conflict" | "unresolvedMarkers" }> {
   const filePath = path.join(targetDir, movedFile);
+  const base = await readBaseCopy(targetDir, recordName);
   const split = splitFrontmatter(await readFile(filePath, "utf-8"), {
     filenameAsTitle: titleMode === "filename",
+    bodyStartsBlank: baseStartsBlank(base),
   });
   const { body } = split;
   const fileTitle = readNoteTitle(split.frontmatter);
@@ -1395,7 +1404,6 @@ export async function mergeRemoteChangeIntoMovedFile(
       : remoteTitle === undefined
         ? clearNoteTitle(split.frontmatter)
         : setNoteTitle(split.frontmatter, remoteTitle);
-  const base = await readBaseCopy(targetDir, recordName);
   if (base !== undefined && body === base) {
     await writeFile(filePath, joinFrontmatter(frontmatter, remoteBodyText), "utf-8");
     await writeBaseCopy(targetDir, recordName, remoteBodyText);

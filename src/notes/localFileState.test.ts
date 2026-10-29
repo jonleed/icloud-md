@@ -138,3 +138,47 @@ test("readLocalNote reports a vanished file as missing, with no content to offer
 
     assert.deepEqual(await readLocalNote(dir, ENTRY, REC), { status: "missing" });
   }));
+
+// --- In-body vault: a note whose title paragraph is empty ---------------------
+//
+// Reproduced on a real account (2026-10-29): five notes whose first line is
+// empty read as modified straight after `clone`, and a plain `push` would
+// have deleted their leading blank lines from the live notes.
+
+test("an in-body note that starts with blank lines is clean, exactly as cloned", () =>
+  withTempDir(async (dir) => {
+    const body = "\n\ndress in a characters color platte\n";
+    await mkdir(path.join(dir, path.dirname(ENTRY.file)), { recursive: true });
+    await writeFile(path.join(dir, ENTRY.file), composeNoteFile("", body, NOTE_ID), "utf-8");
+    await writeBaseCopy(dir, REC, body);
+
+    const local = await readLocalNote(dir, ENTRY, REC, "in-body");
+    if (local.status === "missing") {
+      throw new Error("unreachable");
+    }
+    assert.equal(local.status, "clean");
+    assert.equal(local.body, body);
+  }));
+
+test("an edit below the blank lines keeps them in the body push will send", () =>
+  withTempDir(async (dir) => {
+    await mkdir(path.join(dir, path.dirname(ENTRY.file)), { recursive: true });
+    await writeFile(path.join(dir, ENTRY.file), composeNoteFile("", "\n\nedited line\n", NOTE_ID), "utf-8");
+    await writeBaseCopy(dir, REC, "\n\noriginal line\n");
+
+    const local = await readLocalNote(dir, ENTRY, REC, "in-body");
+    if (local.status === "missing") {
+      throw new Error("unreachable");
+    }
+    assert.equal(local.status, "modified");
+    assert.equal(local.body, "\n\nedited line\n");
+  }));
+
+test("blank lines a user leaves under the frontmatter of an ordinary note stay cosmetic", () =>
+  withTempDir(async (dir) => {
+    await mkdir(path.join(dir, path.dirname(ENTRY.file)), { recursive: true });
+    await writeFile(path.join(dir, ENTRY.file), `---\napple-note-id: ${NOTE_ID}\n---\n\n\n\n${BODY}`, "utf-8");
+    await writeBaseCopy(dir, REC, BODY);
+
+    assert.equal(await localFileState(dir, ENTRY, REC, "in-body"), "clean");
+  }));
