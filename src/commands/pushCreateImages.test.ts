@@ -89,3 +89,15 @@ test("an image file belongs to one note: a second claim, or the same file twice 
   assert.equal(takeAttachmentFiles(claimed, [{ file: "Notes/attachments/new.jpg" }]), undefined);
   assert.equal(takeAttachmentFiles(claimed, [{ file: "Notes/attachments/new.jpg" }]), "Notes/attachments/new.jpg", "the next note can't reuse it");
 });
+
+test("a new note can carry a non-image file, which keeps its plain-link placeholder", () => {
+  const pdf = { attachmentRecordName: "CCCC0000-0000-4000-8000-000000000003", uti: "com.adobe.pdf" };
+  const source = placeholders("Receipts\n[receipt.pdf](attachments/receipt.pdf)\n");
+
+  const built = prepareNoteCreate(source, "Notes/Receipts.md", "in-body", new Map(), REPLICA, [pdf]);
+
+  assert.ok(built.ok, built.ok ? "" : built.reason);
+  const { text, slots } = decode(built.payloadBase64);
+  assert.equal(text, "Receipts\n\ufffc\n");
+  assert.deepEqual(slots?.map((slot) => (slot.kind === "attachment" ? slot.ref.typeUti : slot.kind)), ["com.adobe.pdf"]);
+});

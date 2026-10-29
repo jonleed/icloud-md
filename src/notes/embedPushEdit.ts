@@ -130,20 +130,26 @@ export function planEmbedRepresentations(
       const linkPath = fileAttachmentLinkPaths.get(slot.ref.attachmentIdentifier);
       if (linkPath !== undefined) {
         const expectedLink = formatAttachmentMarkdown(slot.ref, linkPath);
+        // Either form stands for the attachment - an image embed
+        // `![name](href)` or a plain link `[name](href)` - so a file rendered
+        // before its type was known to be an image (or the reverse) still
+        // matches, and a typed "!" never survives as a stray character.
+        const plainLink = expectedLink.startsWith("!") ? expectedLink.slice(1) : expectedLink;
         // Search from just past the previous representation so a repeated
         // link (the same file embedded twice) binds in document order.
         const searchFrom = representations.length > 0 ? (representations[representations.length - 1]?.end ?? 0) : 0;
-        const start = localText.indexOf(expectedLink, searchFrom);
-        if (start === -1) {
-          return {
-            ok: false,
-            reason:
-              `the attachment link ${expectedLink} is missing, edited, or out of order - ` +
-              "attachment links must be left exactly as this tool wrote them",
-          };
+        const found = localText.indexOf(plainLink, searchFrom);
+        const start = found > searchFrom && localText[found - 1] === "!" ? found - 1 : found;
+        if (found !== -1) {
+          representations.push({ start, end: found + plainLink.length });
+          continue;
         }
-        representations.push({ start, end: start + expectedLink.length });
-        continue;
+        return {
+          ok: false,
+          reason:
+            `the attachment link ${expectedLink} is missing, edited, or out of order - ` +
+            "attachment links must be left exactly as this tool wrote them",
+        };
       }
       if (trackedFileAttachmentIds.has(slot.ref.attachmentIdentifier)) {
         return {

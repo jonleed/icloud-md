@@ -111,7 +111,20 @@ export const OBJECT_REPLACEMENT_CHARACTER = "\uFFFC";
 /** UTIs known to render as an image in the Notes web client; anything else
  * gets a plain link rather than an embed. Not exhaustive - deliberately
  * conservative (a wrongly-linked image is cosmetic, not unsafe). */
-const IMAGE_UTIS = new Set(["public.jpeg", "public.png", "public.heic", "public.tiff", "public.gif", "public.webp"]);
+// The identifiers Apple actually writes for GIF and WebP are
+// "com.compuserve.gif" and "org.webmproject.webp" (the latter seen on a real
+// account); the "public." spellings stay for anything older.
+const IMAGE_UTIS = new Set([
+  "public.jpeg",
+  "public.png",
+  "public.heic",
+  "public.heif",
+  "public.tiff",
+  "com.compuserve.gif",
+  "public.gif",
+  "org.webmproject.webp",
+  "public.webp",
+]);
 
 export function isImageUti(typeUti: string): boolean {
   return IMAGE_UTIS.has(typeUti);
@@ -220,10 +233,19 @@ const UTI_EXTENSIONS: Record<string, string> = {
   "public.png": ".png",
   "public.heic": ".heic",
   "public.tiff": ".tiff",
+  "public.heif": ".heif",
+  "com.compuserve.gif": ".gif",
   "public.gif": ".gif",
+  "org.webmproject.webp": ".webp",
   "public.webp": ".webp",
   "com.apple.m4a-audio": ".m4a",
+  "public.mp3": ".mp3",
+  "com.microsoft.waveform-audio": ".wav",
+  "public.mpeg-4": ".mp4",
+  "com.apple.quicktime-movie": ".mov",
   "com.adobe.pdf": ".pdf",
+  "public.plain-text": ".txt",
+  "public.zip-archive": ".zip",
 };
 
 function extensionForUti(typeUti: string): string {

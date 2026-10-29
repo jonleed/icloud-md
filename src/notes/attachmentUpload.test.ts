@@ -5,8 +5,10 @@ import { deflateSync } from "node:zlib";
 import { create } from "@bufbuild/protobuf";
 import {
   attachNewEmbeds,
+  buildAttachmentFields,
   buildImageAttachmentFields,
   buildMediaFields,
+  detectFile,
   detectImage,
 } from "./attachmentUpload.js";
 import { AttributeRunSchema, ParagraphStyleSchema } from "./gen/topotext_pb.js";
@@ -53,7 +55,7 @@ test("detectImage recognizes GIF, WebP, HEIC and TIFF by magic bytes", () => {
   vp8x.write("VP8X", 12, "latin1");
   vp8x.writeUIntLE(99, 24, 3);
   vp8x.writeUIntLE(49, 27, 3);
-  assert.deepEqual(detectImage(vp8x), { uti: "public.webp", width: 100, height: 50 });
+  assert.deepEqual(detectImage(vp8x), { uti: "org.webmproject.webp", width: 100, height: 50 });
 
   const heic = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypheic", "latin1"), Buffer.alloc(12)]);
   assert.deepEqual(detectImage(heic), { uti: "public.heic" });
@@ -150,4 +152,80 @@ test("attachNewEmbeds handles several placeholders and refuses a non-placeholder
     ],
   );
   assert.throws(() => attachNewEmbeds(docWithRuns("T\nx\n", [2, 2]), [{ index: 2, attachmentIdentifier: "C", typeUti: "public.png" }], 1));
+});
+
+// --- Files other than images ---------------------------------------------
+
+/** `count` MPEG-1 Layer III frames at 128 kbit/s, 44.1 kHz (417 bytes each). */
+function mp3Frames(count: number, prefix: Buffer = Buffer.alloc(0)): Buffer {
+  const frame = Buffer.alloc(417);
+  frame.set([0xff, 0xfb, 0x90, 0x00]);
+  return Buffer.concat([prefix, ...Array.from({ length: count }, () => frame)]);
+}
+
+test("detectFile times an MP3 by counting frames, past an ID3 tag, without its Xing frame", () => {
+  // 1152 samples per frame at 44.1 kHz. A real Apple-written attachment
+  // (157.3877551020408 s for 6025 frames) is matched exactly by this count.
+  assert.deepEqual(detectFile(mp3Frames(100), "song.mp3"), { uti: "public.mp3", isImage: false, durationSeconds: (100 * 1152) / 44100 });
+
+  const id3 = Buffer.concat([Buffer.from("ID3\x04\x00\x00\x00\x00\x00\x05", "latin1"), Buffer.alloc(5)]);
+  assert.equal(detectFile(mp3Frames(10, id3), "tagged.mp3")?.durationSeconds, (10 * 1152) / 44100);
+
+  const xing = mp3Frames(11);
+  xing.write("Xing", 4 + 32, "latin1");
+  assert.equal(detectFile(xing, "vbr.mp3")?.durationSeconds, (10 * 1152) / 44100);
+});
+
+test("detectFile times WAV from its data chunk and MP4/M4A from the movie header", () => {
+  const fmt = Buffer.alloc(24);
+  fmt.write("fmt ", 0, "latin1");
+  fmt.writeUInt32LE(16, 4);
+  fmt.writeUInt32LE(176400, 16); // byte rate: 44.1 kHz, 16-bit stereo
+  const data = Buffer.alloc(8 + 352800);
+  data.write("data", 0, "latin1");
+  data.writeUInt32LE(352800, 4);
+  const wav = Buffer.concat([Buffer.from("RIFF\0\0\0\0WAVE", "latin1"), fmt, data]);
+  assert.deepEqual(detectFile(wav, "memo.wav"), { uti: "com.microsoft.waveform-audio", isImage: false, durationSeconds: 2 });
+
+  const box = (type: string, body: Buffer) => {
+    const header = Buffer.alloc(8);
+    header.writeUInt32BE(8 + body.length, 0);
+    header.write(type, 4, "latin1");
+    return Buffer.concat([header, body]);
+  };
+  const mvhd = Buffer.alloc(100);
+  mvhd.writeUInt32BE(600, 12); // timescale
+  mvhd.writeUInt32BE(1800, 16); // duration -> 3 s
+  const m4a = Buffer.concat([box("ftyp", Buffer.from("M4A \0\0\0\0", "latin1")), box("moov", box("mvhd", mvhd))]);
+  assert.deepEqual(detectFile(m4a, "voice.m4a"), { uti: "com.apple.m4a-audio", isImage: false, durationSeconds: 3 });
+  const mp4 = Buffer.concat([box("ftyp", Buffer.from("isom\0\0\0\0", "latin1")), box("moov", box("mvhd", mvhd))]);
+  assert.equal(detectFile(mp4, "clip.mp4")?.uti, "public.mpeg-4");
+});
+
+test("detectFile names PDFs by content and other files by extension, and refuses a misnamed file", () => {
+  assert.deepEqual(detectFile(Buffer.from("%PDF-1.7\n..."), "anything.bin"), { uti: "com.adobe.pdf", isImage: false });
+  assert.deepEqual(detectFile(Buffer.from("hello"), "notes.txt"), { uti: "public.plain-text", isImage: false });
+  assert.deepEqual(detectFile(Buffer.from("PK\x03\x04"), "Report.DOCX"), {
+    uti: "org.openxmlformats.wordprocessingml.document",
+    isImage: false,
+  });
+  assert.deepEqual(detectFile(Buffer.from("??"), "mystery"), { uti: "public.data", isImage: false });
+  assert.equal(detectFile(Buffer.from("not really a pdf"), "fake.pdf"), undefined);
+  assert.equal(detectFile(Buffer.from("not really audio"), "fake.mp3"), undefined);
+  assert.equal(detectFile(Buffer.from("not really a png"), "fake.png"), undefined);
+});
+
+test("buildAttachmentFields writes a file's name and duration, and types FileSize as Apple does", () => {
+  const base = { noteRecordName: "N", mediaRecordName: "M", zoneName: "Notes", fileSize: 4019711, nowMs: 1 };
+
+  const audio = buildAttachmentFields({ ...base, uti: "public.mp3", isImage: false, fileName: "02 Song.mp3", durationSeconds: 157.5 });
+  assert.deepEqual(audio.FileSize, { value: 4019711, type: "INT64" });
+  assert.equal(Buffer.from(String(audio.TitleEncrypted?.value), "base64").toString(), "02 Song.mp3");
+  assert.deepEqual(audio.Duration, { value: 157.5, type: "DOUBLE" });
+  assert.equal(audio.Width, undefined);
+
+  const image = buildAttachmentFields({ ...base, uti: "public.jpeg", isImage: true, fileName: "a.jpg", width: 4, height: 3 });
+  assert.equal(image.TitleEncrypted, undefined, "Apple's image attachments carry no title");
+  assert.equal(image.Duration, undefined);
+  assert.deepEqual([image.Width?.value, image.Height?.value], [4, 3]);
 });

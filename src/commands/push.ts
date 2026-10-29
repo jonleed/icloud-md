@@ -20,9 +20,9 @@ import {
 } from "../cloudkit/databaseClient.js";
 import {
   attachNewEmbeds,
-  buildImageAttachmentFields,
+  buildAttachmentFields,
   buildMediaFields,
-  detectImage,
+  detectFile,
   MAX_NEW_ATTACHMENT_BYTES,
   type NewEmbedPlacement,
 } from "../notes/attachmentUpload.js";
@@ -798,7 +798,7 @@ export async function buildPushPlan(
         kind: "create",
         file,
         resolution: "refused",
-        reason: 'contains an "attachments/..." image, but images can only be added to new notes in your own folders for now',
+        reason: 'contains an "attachments/..." file, but files can only be added to new notes in your own folders for now',
       });
       continue;
     }
@@ -1213,7 +1213,7 @@ export async function buildPushPlan(
                 recordName: attachment.attachmentRecordName,
                 recordType: "Attachment",
                 recordChangeTag: "",
-                fields: buildImageAttachmentFields({
+                fields: buildAttachmentFields({
                   noteRecordName: recordName,
                   mediaRecordName: attachment.mediaRecordName,
                   zoneName: zone.zoneID.zoneName,
@@ -1221,6 +1221,9 @@ export async function buildPushPlan(
                   fileSize: attachment.bytes.length,
                   width: attachment.width,
                   height: attachment.height,
+                  fileName: path.posix.basename(attachment.file),
+                  isImage: attachment.isImage,
+                  durationSeconds: attachment.durationSeconds,
                   nowMs,
                 }),
                 parentRecordName: recordName,
@@ -1950,7 +1953,7 @@ async function prepareEmbedCandidate(
         recordName: attachment.attachmentRecordName,
         recordType: "Attachment",
         recordChangeTag: "",
-        fields: buildImageAttachmentFields({
+        fields: buildAttachmentFields({
           noteRecordName: record.recordName,
           mediaRecordName: attachment.mediaRecordName,
           zoneName: zone.zoneID.zoneName,
@@ -1958,6 +1961,9 @@ async function prepareEmbedCandidate(
           fileSize: attachment.bytes.length,
           width: attachment.width,
           height: attachment.height,
+          fileName: path.posix.basename(attachment.file),
+          isImage: attachment.isImage,
+          durationSeconds: attachment.durationSeconds,
           nowMs,
         }),
         parentRecordName: record.recordName,
@@ -2088,8 +2094,10 @@ function sharedAttachmentReason(file: string): string {
 interface ResolvedNewAttachment extends PreparedNewAttachment {
   ordinal: number;
   uti: string;
+  isImage: boolean;
   width?: number | undefined;
   height?: number | undefined;
+  durationSeconds?: number | undefined;
 }
 
 /**
@@ -2107,9 +2115,6 @@ async function resolveNewAttachments(
   const noteDir = path.posix.dirname(noteFile.split(path.sep).join("/"));
   const resolved: ResolvedNewAttachment[] = [];
   for (const link of links) {
-    if (!link.isImage) {
-      return refuse(`${link.linkText} isn't an image embed (\`![...](...)\`) - only images can be added for now`);
-    }
     const file = path.posix.normalize(path.posix.join(noteDir, link.href));
     if (path.posix.isAbsolute(file) || file === ".." || file.startsWith("../")) {
       return refuse(`${link.linkText} points outside the vault`);
@@ -2127,9 +2132,9 @@ async function resolveNewAttachments(
       return refuse(`${link.linkText} is ${info.size === 0 ? "empty" : "larger than the 100 MB limit"}`);
     }
     const bytes = new Uint8Array(await readFile(path.join(targetDir, file)));
-    const image = detectImage(bytes);
-    if (!image) {
-      return refuse(`${link.linkText} isn't a PNG, JPEG, GIF, WebP, HEIC or TIFF image`);
+    const detected = detectFile(bytes, path.posix.basename(file));
+    if (!detected) {
+      return refuse(`${link.linkText}: the file's contents don't match its extension`);
     }
     const attachmentRecordName = randomUUID().toUpperCase();
     resolved.push({
@@ -2140,12 +2145,14 @@ async function resolveNewAttachments(
       bytes,
       linkText: link.linkText,
       canonicalLinkText: formatAttachmentMarkdown(
-        { attachmentIdentifier: attachmentRecordName, typeUti: image.uti },
+        { attachmentIdentifier: attachmentRecordName, typeUti: detected.uti },
         path.posix.relative(noteDir, file),
       ),
-      uti: image.uti,
-      width: image.width,
-      height: image.height,
+      uti: detected.uti,
+      isImage: detected.isImage,
+      width: detected.width,
+      height: detected.height,
+      durationSeconds: detected.durationSeconds,
     });
   }
   return resolved;

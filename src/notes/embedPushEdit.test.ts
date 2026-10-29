@@ -121,6 +121,22 @@ test("non-image attachments use their plain-link form", () => {
   assert.equal(plan.reconstructedBodyText, `T\n${OBJECT_REPLACEMENT_CHARACTER}\n`);
 });
 
+test("a tracked attachment matches in either link form, and a typed \"!\" never survives as text", () => {
+  // A file rendered as a plain link before its type was known to be an
+  // image (WebP, under Apple's "org.webmproject.webp"), and the reverse.
+  const asLink = expectOk(planEmbedRepresentations(`T\n${IMAGE_LINK.slice(1)}\n`, [IMAGE_SLOT], new Set(LINKS.keys()), LINKS));
+  assert.equal(asLink.reconstructedBodyText, `T\n${OBJECT_REPLACEMENT_CHARACTER}\n`);
+  const asEmbed = expectOk(planEmbedRepresentations(`T\n!${PDF_LINK}\n`, [PDF_SLOT], new Set(LINKS.keys()), LINKS));
+  assert.equal(asEmbed.reconstructedBodyText, `T\n${OBJECT_REPLACEMENT_CHARACTER}\n`, "the ! belongs to the link, not the text");
+});
+
+test("a \"!\" ending the previous attachment's link is not taken for the next one", () => {
+  const twoPdfs: EmbedSlot = { kind: "attachment", ref: { attachmentIdentifier: "PDF-2", typeUti: "com.adobe.pdf" } };
+  const links = new Map([...LINKS, ["PDF-2", "attachments/two.pdf"]]);
+  const plan = expectOk(planEmbedRepresentations(`T\n${PDF_LINK}![two.pdf](attachments/two.pdf)!\n`, [PDF_SLOT, twoPdfs], new Set(links.keys()), links));
+  assert.equal(plan.reconstructedBodyText, `T\n${OBJECT_REPLACEMENT_CHARACTER}${OBJECT_REPLACEMENT_CHARACTER}!\n`);
+});
+
 test("file links, markers and tables interleave in document order", () => {
   const table = renderMarkdownTable([["A"]]);
   const localText = `T\n${IMAGE_LINK}\n${GALLERY_MARKER}\n${table}\n${PDF_LINK}`;
