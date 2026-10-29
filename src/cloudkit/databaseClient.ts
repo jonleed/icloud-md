@@ -1102,13 +1102,62 @@ export interface RecordUpdate {
    * a table write needs to update a Note record and an Attachment record
    * (the table's own `MergeableDataEncrypted`) atomically in one call. */
   recordType: string;
-  /** Optimistic-concurrency token; see `NoteUpdate`. */
+  /** Optimistic-concurrency token; see `NoteUpdate`. Ignored for a create. */
   recordChangeTag: string;
   fields: Record<string, { value: unknown }>;
   parentRecordName?: string | undefined;
+  /** "create" for a brand-new record riding in the same atomic batch as the
+   * updates (a new image's Media and Attachment records alongside the note
+   * that embeds it). Default "update". */
+  operationType?: "update" | "create" | undefined;
 }
 
 export type RecordUpdateResult = NoteUpdateResult;
+
+/**
+ * Uploads one file for a record's asset field through CloudKit's two-step
+ * asset flow: `assets/upload` hands back a one-time upload URL for the named
+ * (record, field), and POSTing the raw bytes there returns the `singleFile`
+ * dictionary that then goes, verbatim, into the record's field value in the
+ * following `records/modify`. The upload alone changes nothing in the zone -
+ * an asset nobody references is never attached to anything.
+ */
+export async function uploadAsset(
+  session: IcloudSession,
+  ckDatabaseHost: string,
+  dsid: string,
+  database: CloudKitDatabase,
+  zoneID: CloudKitZoneID,
+  target: { recordType: string; fieldName: string; recordName: string },
+  bytes: Uint8Array,
+): Promise<Record<string, unknown>> {
+  const body = await postDatabase("uploadAsset:assets/upload", session, ckDatabaseHost, dsid, database, "assets/upload", {
+    zoneID,
+    tokens: [target],
+  });
+  const token = isRecord(body) && Array.isArray(body.tokens) ? body.tokens[0] : undefined;
+  if (!isRecord(token) || typeof token.url !== "string" || !token.url.startsWith("https://")) {
+    throw new CloudKitRequestFailedError("assets/upload returned no upload URL");
+  }
+  const response = await loggedFetch("uploadAsset:content", token.url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      Origin: "https://www.icloud.com",
+      Referer: "https://www.icloud.com/",
+    },
+    body: Buffer.from(bytes),
+  });
+  if (!response.ok) {
+    throw new CloudKitRequestFailedError(`asset upload failed: HTTP ${response.status}`);
+  }
+  const uploaded: unknown = await response.json();
+  const singleFile = isRecord(uploaded) ? uploaded.singleFile : undefined;
+  if (!isRecord(singleFile) || typeof singleFile.fileChecksum !== "string") {
+    throw new CloudKitRequestFailedError("asset upload returned no singleFile");
+  }
+  return singleFile;
+}
 
 /**
  * Updates any number of records in one zone via a single `records/modify`
@@ -1132,16 +1181,17 @@ export async function updateRecords(
   updates: RecordUpdate[],
 ): Promise<RecordUpdateResult[]> {
   const operations = updates.map((update) => {
+    const isCreate = update.operationType === "create";
     const record: Record<string, unknown> = {
       recordName: update.recordName,
       recordType: update.recordType,
-      recordChangeTag: update.recordChangeTag,
+      ...(isCreate ? {} : { recordChangeTag: update.recordChangeTag }),
       fields: update.fields,
     };
     if (update.parentRecordName !== undefined) {
       record.parent = { recordName: update.parentRecordName };
     }
-    return { operationType: "update", record };
+    return { operationType: isCreate ? "create" : "update", record };
   });
 
   const body = await postDatabase(

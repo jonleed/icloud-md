@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveFolderAccount } from "../auth/folderAuth.js";
 import { planFolderCreates } from "../notes/folderCreate.js";
@@ -13,10 +13,20 @@ import {
   noteZone,
   updateNoteRecord,
   updateRecords,
+  uploadAsset,
   type CloudKitRecord,
   type NoteZone,
   type RecordUpdate,
 } from "../cloudkit/databaseClient.js";
+import {
+  attachNewEmbeds,
+  buildImageAttachmentFields,
+  buildMediaFields,
+  detectImage,
+  MAX_NEW_ATTACHMENT_BYTES,
+  type NewEmbedPlacement,
+} from "../notes/attachmentUpload.js";
+import { formatAttachmentMarkdown } from "../notes/noteAttachments.js";
 import { readBaseCopy, writeBaseCopy } from "../notes/baseCopy.js";
 import { writeCloneState, type CloneState, type CloneStateNoteEntry, type TitleMode } from "../notes/cloneState.js";
 import { migrationReporter, openVault } from "../notes/vaultMigrations.js";
@@ -37,7 +47,7 @@ import { classifyNoteRecord, storesTextAsAsset, TEXT_AS_ASSET_REASON, type NoteD
 import { CorruptStateFileError, NotClonedDirectoryError, NotesUnavailableError } from "../errors.js";
 import { buildNoteCreateFields, buildNoteMoveFields, buildNoteTrashFields, buildNoteUpdateFields } from "../notes/encodeNoteRecord.js";
 import { noteDirOf, stateDirIndex, type StateDirInfo } from "../notes/folderLayout.js";
-import { planEmbedRepresentations } from "../notes/embedPushEdit.js";
+import { planEmbedRepresentations, type NewAttachmentLink } from "../notes/embedPushEdit.js";
 import { isEnoent } from "../fsUtil.js";
 import { hasConflictMarkers, mergeNoteVersions } from "../notes/mergeConflict.js";
 import { decodeNoteEmbedSlots, hasAttachmentReference, OBJECT_REPLACEMENT_CHARACTER, type EmbedSlot } from "../notes/noteAttachments.js";
@@ -169,10 +179,25 @@ type OkNoteRecordResult = Extract<NoteDecodeResult, { status: "ok" }>;
 interface PreparedCandidate {
   updates: RecordUpdate[];
   noteTextUpdated: boolean;
+  /** New images this update embeds: each one's bytes are uploaded at execute
+   * time (never while planning - `status` and `--dry-run` plan too) into the
+   * `Asset` field of the matching `Media` create in `updates`. */
+  newAttachments?: PreparedNewAttachment[] | undefined;
   /** The new title this update carries, when an `apple-note-title` asked for
    * one the note didn't already have - what the plan entry's remark reports.
    * Undefined for the ordinary content update, which changes no title. */
   retitledTo?: string | undefined;
+}
+
+interface PreparedNewAttachment {
+  attachmentRecordName: string;
+  mediaRecordName: string;
+  /** Vault-relative path of the local file. */
+  file: string;
+  bytes: Uint8Array;
+  /** The link as the user wrote it, and as pull will render it from now on. */
+  linkText: string;
+  canonicalLinkText: string;
 }
 
 /** What actually happened when an `ExecutablePlanEntry.execute` ran: whether
@@ -417,27 +442,9 @@ export async function buildPushPlan(
       });
       continue;
     }
-    // A note that doesn't already have a tracked attachment but whose text
-    // now contains an "attachments/..." reference was hand-typed (or
-    // copy-pasted), not produced by `clone`/`pull` - there's no real file to
-    // upload behind it. A note that *does* already have a tracked attachment
-    // is caught more specifically below, once we have the remote record to
-    // point at. Table attachments aren't tracked in state.attachments at all
-    // (see `attachmentSync.ts`), so this check never fires for them.
-    const notePreviouslyHadAttachments = Object.values(state.attachments ?? {}).some(
-      (attachment) => attachment.noteRecordName === recordName,
-    );
-    if (!notePreviouslyHadAttachments && hasAttachmentReference(localText)) {
-      entries.push({
-        kind: "update",
-        file: entry.file,
-        resolution: "refused",
-        reason:
-          'contains an "attachments/..." reference, but this tool can\'t upload new attachments - ' +
-          `remove it, or run "icloud-md restore ${entry.file}" to discard the edit.`,
-      });
-      continue;
-    }
+    // An "attachments/..." link the note didn't have before is a new file to
+    // embed: the embed planner (`prepareEmbedCandidate`) uploads it if it's a
+    // real image inside the vault and refuses it otherwise.
     updateCandidates.push({ recordName, entry, localText, frontmatter, requestedTitle, statedTitle, titleOnly });
   }
 
@@ -1365,6 +1372,27 @@ export async function buildPushPlan(
       resolution: "ready",
       ...(prepared.retitledTo !== undefined ? { remark: retitleRemark(prepared.retitledTo) } : {}),
       execute: async () => {
+        // New images upload first: the bytes have to exist before a Media
+        // record can reference them. An upload nobody references is inert,
+        // so a failure here (or in the batch below) changes nothing visible.
+        const uploaded = new Map<string, Record<string, unknown>>();
+        for (const attachment of prepared.newAttachments ?? []) {
+          const singleFile = await uploadAsset(
+            session,
+            ckdatabasewsUrl,
+            dsid,
+            zone.database,
+            zone.zoneID,
+            { recordType: "Media", fieldName: "Asset", recordName: attachment.mediaRecordName },
+            attachment.bytes,
+          );
+          uploaded.set(attachment.mediaRecordName, singleFile);
+          const media = prepared.updates.find((update) => update.recordName === attachment.mediaRecordName);
+          if (!media) {
+            return { succeeded: false, message: `${entry.file}: internal error - no Media record for a new image` };
+          }
+          media.fields.Asset = { value: singleFile };
+        }
         const results = await updateRecords(session, ckdatabasewsUrl, dsid, zone.database, zone.zoneID, prepared.updates);
         const failure = results.find((result) => !result.ok);
         if (failure && !failure.ok) {
@@ -1397,7 +1425,33 @@ export async function buildPushPlan(
             await applyNoteFileTimes(path.join(targetDir, entry.file), noteResult.record);
           }
         }
-        await writeBaseCopy(targetDir, recordName, localText);
+        let syncedText = localText;
+        if (prepared.newAttachments && prepared.newAttachments.length > 0) {
+          state.attachments ??= {};
+          for (const attachment of prepared.newAttachments) {
+            const mediaResult = results.find((result) => result.ok && result.record.recordName === attachment.mediaRecordName);
+            const asset = mediaResult?.ok ? mediaResult.record.fields.Asset?.value : undefined;
+            const checksum =
+              (asset && typeof asset === "object" && typeof (asset as { fileChecksum?: unknown }).fileChecksum === "string"
+                ? (asset as { fileChecksum: string }).fileChecksum
+                : undefined) ?? String(uploaded.get(attachment.mediaRecordName)?.fileChecksum ?? "");
+            state.attachments[attachment.attachmentRecordName] = {
+              file: attachment.file,
+              mediaRecordName: attachment.mediaRecordName,
+              mediaFileChecksum: checksum,
+              noteRecordName: recordName,
+            };
+          }
+          // Rewrite each new link to the exact form pull renders, so the next
+          // push matches it as this attachment's link rather than a new one.
+          syncedText = canonicalizeNewLinks(localText, prepared.newAttachments);
+          if (syncedText !== localText) {
+            const filePath = path.join(targetDir, entry.file);
+            const content = await readFile(filePath, "utf-8");
+            await writeFile(filePath, canonicalizeNewLinks(content, prepared.newAttachments));
+          }
+        }
+        await writeBaseCopy(targetDir, recordName, syncedText);
         // A whole-note index over what just landed remotely, mirroring
         // `pull`'s own capture - see the "Whole-note coordinated version
         // epochs" investigation.
@@ -1574,7 +1628,7 @@ async function prepareUpdate(
     return undefined;
   }
 
-  if (classified.embedSlots.length > 0) {
+  if (classified.embedSlots.length > 0 || hasAttachmentReference(localText)) {
     return prepareEmbedCandidate(
       session,
       ckdatabasewsUrl,
@@ -1659,6 +1713,34 @@ async function prepareEmbedCandidate(
     summary.refused.push(`${entry.file}: ${plan.reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
     return undefined;
   }
+  const newAttachments = await resolveNewAttachments(targetDir, entry, plan.newAttachments, summary);
+  if (newAttachments === undefined) {
+    return undefined;
+  }
+  // The slot list the rebuilt document must carry: the note's existing
+  // embeds, untouched and in order, with each new image at its ordinal.
+  const expectedSlots: EmbedSlot[] = [];
+  const newEmbeds: { ordinal: number; attachmentIdentifier: string; typeUti: string }[] = [];
+  {
+    let existing = 0;
+    const byOrdinal = new Map(newAttachments.map((attachment) => [attachment.ordinal, attachment]));
+    const total = classified.embedSlots.length + newAttachments.length;
+    for (let ordinal = 0; ordinal < total; ordinal += 1) {
+      const fresh = byOrdinal.get(ordinal);
+      if (fresh) {
+        expectedSlots.push({ kind: "attachment", ref: { attachmentIdentifier: fresh.attachmentRecordName, typeUti: fresh.uti } });
+        newEmbeds.push({ ordinal, attachmentIdentifier: fresh.attachmentRecordName, typeUti: fresh.uti });
+      } else {
+        const slot = classified.embedSlots[existing];
+        existing += 1;
+        if (!slot) {
+          summary.refused.push(`${entry.file}: couldn't line up this note's embeds with the local file - refusing to push`);
+          return undefined;
+        }
+        expectedSlots.push(slot);
+      }
+    }
+  }
   // The placeholder-form markdown (markers and table blocks re-spliced to
   // U+FFFC) is what parses back into the desired text + formatting.
   const parsed = parseLocalMarkdown(plan.reconstructedBodyText);
@@ -1742,7 +1824,7 @@ async function prepareEmbedCandidate(
   const retitledTo = requestedRetitle(classified, requestedTitle);
   let noteTextUpdated = false;
   if (plan.reconstructedBodyText !== classified.markdownText || retitledTo !== undefined) {
-    const textUpdate = prepareNoteTextUpdate(record, classified.bodyText, desired, classified.embedSlots, replicaId, entry, summary);
+    const textUpdate = prepareNoteTextUpdate(record, classified.bodyText, desired, expectedSlots, replicaId, entry, summary, newEmbeds);
     if (!textUpdate) {
       return undefined;
     }
@@ -1755,13 +1837,139 @@ async function prepareEmbedCandidate(
     // rendering - no note-text update needed (tables may still update).
   }
 
+  if (newAttachments.length > 0) {
+    if (!noteTextUpdated) {
+      summary.refused.push(`${entry.file}: couldn't build the note update that embeds the new image - refusing to push`);
+      return undefined;
+    }
+    // Same order as the live-validated image insert (apple-note-clone M3,
+    // 2026-08-27): the note first (so `updates[0]` stays the note, which the
+    // executor relies on), then each image's Media and Attachment creates,
+    // all in one atomic records/modify. Both name the note as their CloudKit
+    // parent, as Apple's own image records do.
+    const nowMs = Date.now();
+    for (const attachment of newAttachments) {
+      updates.push({
+        operationType: "create",
+        recordName: attachment.mediaRecordName,
+        recordType: "Media",
+        recordChangeTag: "",
+        fields: buildMediaFields(path.posix.basename(attachment.file), null),
+        parentRecordName: record.recordName,
+      });
+      updates.push({
+        operationType: "create",
+        recordName: attachment.attachmentRecordName,
+        recordType: "Attachment",
+        recordChangeTag: "",
+        fields: buildImageAttachmentFields({
+          noteRecordName: record.recordName,
+          mediaRecordName: attachment.mediaRecordName,
+          zoneName: zone.zoneID.zoneName,
+          uti: attachment.uti,
+          fileSize: attachment.bytes.length,
+          width: attachment.width,
+          height: attachment.height,
+          nowMs,
+        }),
+        parentRecordName: record.recordName,
+      });
+    }
+  }
+
   if (updates.length === 0) {
     // Every table's diff resolved to a no-op and the surrounding prose
     // didn't change either - `readLocalNote` said "modified", but nothing
     // about the note's actual content differs from the last sync.
     return { updates: [], noteTextUpdated: false };
   }
-  return { updates, noteTextUpdated, retitledTo };
+  return { updates, noteTextUpdated, retitledTo, newAttachments };
+}
+
+/** Replaces each new attachment's link, in document order, with the form
+ * pull renders for it. */
+function canonicalizeNewLinks(text: string, attachments: readonly PreparedNewAttachment[]): string {
+  let out = text;
+  let cursor = 0;
+  for (const attachment of attachments) {
+    const at = out.indexOf(attachment.linkText, cursor);
+    if (at === -1) {
+      continue;
+    }
+    out = out.slice(0, at) + attachment.canonicalLinkText + out.slice(at + attachment.linkText.length);
+    cursor = at + attachment.canonicalLinkText.length;
+  }
+  return out;
+}
+
+interface ResolvedNewAttachment extends PreparedNewAttachment {
+  ordinal: number;
+  uti: string;
+  width?: number | undefined;
+  height?: number | undefined;
+}
+
+/**
+ * Turns each new `attachments/...` link into a file ready to upload, or
+ * refuses the push: the target has to be a regular file (not a symlink)
+ * inside the vault, within the size cap, and an image format Apple Notes
+ * stores - checked by its bytes, not its extension.
+ */
+async function resolveNewAttachments(
+  targetDir: string,
+  entry: CloneStateNoteEntry,
+  links: readonly NewAttachmentLink[],
+  summary: PushSummary,
+): Promise<ResolvedNewAttachment[] | undefined> {
+  const refuse = (reason: string): undefined => {
+    summary.refused.push(`${entry.file}: ${reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
+    return undefined;
+  };
+  const noteDir = path.posix.dirname(entry.file.split(path.sep).join("/"));
+  const resolved: ResolvedNewAttachment[] = [];
+  for (const link of links) {
+    if (!link.isImage) {
+      return refuse(`${link.linkText} isn't an image embed (\`![...](...)\`) - only images can be added for now`);
+    }
+    const file = path.posix.normalize(path.posix.join(noteDir, link.href));
+    if (path.posix.isAbsolute(file) || file === ".." || file.startsWith("../")) {
+      return refuse(`${link.linkText} points outside the vault`);
+    }
+    let info;
+    try {
+      info = await lstat(path.join(targetDir, file));
+    } catch {
+      return refuse(`${link.linkText} points at a file that doesn't exist (${file})`);
+    }
+    if (!info.isFile()) {
+      return refuse(`${link.linkText} must point at a regular file, not a link or directory`);
+    }
+    if (info.size === 0 || info.size > MAX_NEW_ATTACHMENT_BYTES) {
+      return refuse(`${link.linkText} is ${info.size === 0 ? "empty" : "larger than the 100 MB limit"}`);
+    }
+    const bytes = new Uint8Array(await readFile(path.join(targetDir, file)));
+    const image = detectImage(bytes);
+    if (!image) {
+      return refuse(`${link.linkText} isn't a PNG, JPEG, GIF, WebP, HEIC or TIFF image`);
+    }
+    const attachmentRecordName = randomUUID().toUpperCase();
+    resolved.push({
+      ordinal: link.ordinal,
+      attachmentRecordName,
+      mediaRecordName: randomUUID().toUpperCase(),
+      file,
+      bytes,
+      linkText: link.linkText,
+      canonicalLinkText: formatAttachmentMarkdown(
+        { attachmentIdentifier: attachmentRecordName, typeUti: image.uti },
+        path.posix.relative(noteDir, file),
+      ),
+      uti: image.uti,
+      width: image.width,
+      height: image.height,
+    });
+  }
+  return resolved;
 }
 
 /**
@@ -2130,6 +2338,10 @@ export function prepareNoteTextUpdate(
   replicaId: Uint8Array,
   entry: CloneStateNoteEntry,
   summary: PushSummary,
+  /** Images being added by this edit: the only placeholders the edit may
+   * insert. `ordinal` is the placeholder's position among all of
+   * `desired.text`'s placeholders (matching `expectedSlots`). */
+  newEmbeds: readonly { ordinal: number; attachmentIdentifier: string; typeUti: string }[] = [],
 ): NoteTextUpdate | undefined {
   const textField = record.fields.TextDataEncrypted;
   if (!textField || typeof textField.value !== "string") {
@@ -2157,11 +2369,17 @@ export function prepareNoteTextUpdate(
   // tombstoning one (or typing a literal one) would sever the CRDT character
   // its attachmentInfo run points at, even if the visible text ends up with
   // the right placeholder count. Embeds can't be moved through this tool.
-  const spliceTouchesPlaceholder = computeSplices(currentBodyText, desired.text).some(
-    (splice) =>
-      currentBodyText.slice(splice.start, splice.start + splice.deleteLength).includes(OBJECT_REPLACEMENT_CHARACTER) ||
-      splice.insertText.includes(OBJECT_REPLACEMENT_CHARACTER),
+  // The one exception is a new image: its placeholder is inserted fresh
+  // (never moved from elsewhere), so exactly `newEmbeds.length` of them may
+  // appear in inserted text and none may disappear.
+  const splices = computeSplices(currentBodyText, desired.text);
+  const countPlaceholders = (text: string) => text.split(OBJECT_REPLACEMENT_CHARACTER).length - 1;
+  const deletedPlaceholders = splices.reduce(
+    (sum, splice) => sum + countPlaceholders(currentBodyText.slice(splice.start, splice.start + splice.deleteLength)),
+    0,
   );
+  const insertedPlaceholders = splices.reduce((sum, splice) => sum + countPlaceholders(splice.insertText), 0);
+  const spliceTouchesPlaceholder = deletedPlaceholders > 0 || insertedPlaceholders !== newEmbeds.length;
   if (spliceTouchesPlaceholder) {
     summary.refused.push(
       `${entry.file}: this edit would delete or move an embedded object - embeds can only be edited in Notes itself. ` +
@@ -2177,6 +2395,22 @@ export function prepareNoteTextUpdate(
       return undefined;
     }
     const textChanged = applyTextEdit(doc, desired.text, { replicaId });
+    if (newEmbeds.length > 0) {
+      const placeholderIndexes: number[] = [];
+      for (let i = 0; i < doc.text.length; i += 1) {
+        if (doc.text[i] === OBJECT_REPLACEMENT_CHARACTER) {
+          placeholderIndexes.push(i);
+        }
+      }
+      const placements: NewEmbedPlacement[] = newEmbeds.map((embed) => {
+        const index = placeholderIndexes[embed.ordinal];
+        if (index === undefined) {
+          throw new Error("a new image's placeholder is missing from the edited text");
+        }
+        return { index, attachmentIdentifier: embed.attachmentIdentifier, typeUti: embed.typeUti };
+      });
+      attachNewEmbeds(doc, placements, Math.floor(Date.now() / 1000));
+    }
     const reconciled = reconcileNoteFormat(doc, desired.paragraphs, replicaId);
     if (!reconciled.ok) {
       summary.refused.push(

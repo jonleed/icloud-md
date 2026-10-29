@@ -159,14 +159,54 @@ test("reordered attachment links refuse the push", () => {
   );
 });
 
-test("a duplicated or hand-typed extra attachment link refuses the push", () => {
-  expectRefusal(
-    planEmbedRepresentations(`T\n${IMAGE_LINK}\n${IMAGE_LINK}`, [IMAGE_SLOT], new Set(LINKS.keys()), LINKS),
-    /extra "attachments\/\.\.\." link/,
+test("a hand-typed or duplicated attachment link on its own line becomes a new attachment", () => {
+  const dup = expectOk(planEmbedRepresentations(`T\n${IMAGE_LINK}\n${IMAGE_LINK}`, [IMAGE_SLOT], new Set(LINKS.keys()), LINKS));
+  assert.deepEqual(dup.newAttachments, [
+    { ordinal: 1, linkText: IMAGE_LINK, href: "attachments/photo 1.jpeg", isImage: true },
+  ]);
+  const P = OBJECT_REPLACEMENT_CHARACTER;
+  assert.equal(dup.reconstructedBodyText, `T\n${P}\n${P}`);
+
+  const fresh = expectOk(
+    planEmbedRepresentations(`T\n![new](attachments/new%20pic.png)\n${IMAGE_LINK}`, [IMAGE_SLOT], new Set(LINKS.keys()), LINKS),
   );
+  assert.deepEqual(fresh.newAttachments, [
+    { ordinal: 0, linkText: "![new](attachments/new%20pic.png)", href: "attachments/new pic.png", isImage: true },
+  ]);
+  assert.equal(fresh.reconstructedBodyText, `T\n${P}\n${P}`);
+});
+
+test("a new attachment link in a note with no embeds yet", () => {
+  const plan = expectOk(planEmbedRepresentations("Title\nintro\n![a](attachments/a.png)\nafter\n", [], NO_FILES));
+  assert.equal(plan.reconstructedBodyText, `Title\nintro\n${OBJECT_REPLACEMENT_CHARACTER}\nafter\n`);
+  assert.equal(plan.newAttachments.length, 1);
+  assert.equal(plan.newAttachments[0]?.ordinal, 0);
+});
+
+test("a new attachment link sharing its line with prose refuses the push", () => {
   expectRefusal(
-    planEmbedRepresentations(`T\n${IMAGE_LINK}\n![new](attachments/new.png)`, [IMAGE_SLOT], new Set(LINKS.keys()), LINKS),
-    /extra "attachments\/\.\.\." link/,
+    planEmbedRepresentations("T\nsee ![a](attachments/a.png) here", [], NO_FILES),
+    /must be on a line of its own/,
+  );
+});
+
+test("existing embeds still map to their own placeholders when new ones interleave", () => {
+  const P = OBJECT_REPLACEMENT_CHARACTER;
+  const plan = expectOk(
+    planEmbedRepresentations(
+      `T\n![n1](attachments/n1.png)\n${GALLERY_MARKER}\n![n2](attachments/n2.png)\n${PDF_LINK}`,
+      [GALLERY_SLOT, PDF_SLOT],
+      new Set(LINKS.keys()),
+      LINKS,
+    ),
+  );
+  assert.equal(plan.reconstructedBodyText, `T\n${P}\n${P}\n${P}\n${P}`);
+  assert.deepEqual(
+    plan.newAttachments.map((n) => [n.ordinal, n.href]),
+    [
+      [0, "attachments/n1.png"],
+      [2, "attachments/n2.png"],
+    ],
   );
 });
 

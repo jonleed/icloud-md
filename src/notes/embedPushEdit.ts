@@ -37,8 +37,26 @@ export type EmbedRepresentationPlan =
       reconstructedBodyText: string;
       /** Table slots in document order (may be empty). */
       tables: MatchedTableBlock[];
+      /** Links to files that aren't attachments yet, in document order;
+       * each `ordinal` is its placeholder's position among all of
+       * `reconstructedBodyText`'s placeholders. */
+      newAttachments: NewAttachmentLink[];
     }
   | { ok: false; reason: string };
+
+/** A local `attachments/...` link with no attachment record behind it yet -
+ * a file for `push` to upload and embed. */
+export interface NewAttachmentLink {
+  ordinal: number;
+  /** The link exactly as written, e.g. `![x](attachments/x%201.png)`. */
+  linkText: string;
+  /** Its target, URI-decoded and relative to the note's own directory. */
+  href: string;
+  /** `![...](...)` rather than `[...](...)`. */
+  isImage: boolean;
+}
+
+const ATTACHMENT_LINK_PATTERN = /(!?)\[[^\]\n]*\]\((attachments\/[^)\n]+)\)/g;
 
 interface LocalRepresentation {
   /** Character range [start, end) in `localText` this representation spans. */
@@ -193,21 +211,57 @@ export function planEmbedRepresentations(
     previousEnd = representation.end;
   }
 
+  // Every remaining "attachments/..." link is a new file to upload: it is
+  // not one pull wrote for an existing embed (those were all consumed
+  // above). Apple's clients always give an image its own paragraph, so a new
+  // link must stand alone on its line - anything else is refused rather than
+  // silently pushed as literal text.
+  const newAttachments: NewAttachmentLink[] = [];
+  const combined: { start: number; end: number; newLink?: NewAttachmentLink }[] = [...representations];
+  for (const match of localText.matchAll(ATTACHMENT_LINK_PATTERN)) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (representations.some((r) => start < r.end && end > r.start)) {
+      continue;
+    }
+    const lineStart = localText.lastIndexOf("\n", start - 1) + 1;
+    const lineEndIndex = localText.indexOf("\n", end);
+    const lineEnd = lineEndIndex === -1 ? localText.length : lineEndIndex;
+    if (localText.slice(lineStart, start).trim() !== "" || localText.slice(end, lineEnd).trim() !== "") {
+      return {
+        ok: false,
+        reason: `the new attachment link ${match[0]} must be on a line of its own`,
+      };
+    }
+    let href: string;
+    try {
+      href = decodeURIComponent(match[2] ?? "");
+    } catch {
+      return { ok: false, reason: `the attachment link ${match[0]} has a malformed path` };
+    }
+    const link: NewAttachmentLink = { ordinal: -1, linkText: match[0], href, isImage: match[1] === "!" };
+    combined.push({ start, end, newLink: link });
+  }
+  combined.sort((a, b) => a.start - b.start);
+  combined.forEach((representation, ordinal) => {
+    if (representation.newLink) {
+      representation.newLink.ordinal = ordinal;
+      newAttachments.push(representation.newLink);
+    }
+  });
+
   // Splice each representation back down to its placeholder, right to left
   // so earlier offsets stay valid.
   let reconstructed = localText;
-  for (const representation of [...representations].reverse()) {
+  for (const representation of [...combined].reverse()) {
     reconstructed =
       reconstructed.slice(0, representation.start) + OBJECT_REPLACEMENT_CHARACTER + reconstructed.slice(representation.end);
   }
 
-  // Any "attachments/..." link left over after every tracked one was spliced
-  // out is a duplicate or hand-typed reference with no uploaded file behind
-  // it; pushing it would silently become literal text.
   if (hasAttachmentReference(reconstructed)) {
     return {
       ok: false,
-      reason: 'contains an extra "attachments/..." link this tool can\'t upload - remove it',
+      reason: 'contains an "attachments/..." link this tool couldn\'t place - remove it',
     };
   }
 
@@ -215,6 +269,7 @@ export function planEmbedRepresentations(
     ok: true,
     reconstructedBodyText: reconstructed,
     tables: representations.flatMap((representation) => (representation.table ? [representation.table] : [])),
+    newAttachments,
   };
 }
 
