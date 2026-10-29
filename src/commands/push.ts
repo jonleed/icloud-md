@@ -79,6 +79,7 @@ import {
   encodeNoteDocument,
   noteDocumentRoundTrips,
   parseNoteDocument,
+  replicaTableIsSorted,
   validateDocumentInvariants,
 } from "../notes/noteDocument.js";
 
@@ -2422,6 +2423,13 @@ export function prepareNoteTextUpdate(
       return { status: "unchanged" };
     }
     validateDocumentInvariants(doc);
+    // Apple's clients re-sort this table on load without renumbering the
+    // charIDs that index it; an unsorted upload makes them show the note's
+    // body twice (upstream issue #54). Never send one.
+    if (!replicaTableIsSorted(doc.replicas)) {
+      summary.refused.push(`${entry.file}: rebuilt document's replica table isn't sorted - refusing to push`);
+      return undefined;
+    }
     const compressed = compressNoteDocument(encodeNoteDocument(doc));
     if (decodeNoteBodyText(compressed) !== desired.text) {
       summary.refused.push(`${entry.file}: rebuilt document failed decode verification - refusing to push`);

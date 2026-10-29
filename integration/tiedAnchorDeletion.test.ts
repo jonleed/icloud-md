@@ -110,6 +110,12 @@ test("the tombstoned runs keep their original style timestamp instead of being r
   assert.equal(tiedAnchors.length, tiedRuns);
   assert.equal(correctAnchors.length, tiedRuns);
 
+  // Replica indexes differ between the original and edited documents when
+  // our replica sorts before an existing one (it is inserted in UUID order),
+  // so translate through the UUIDs rather than comparing raw indexes.
+  const idAt = (doc: typeof original, index: number) => (index === 0 ? "" : Buffer.from(doc.replicas[index - 1]?.id ?? []).toString("hex"));
+  const sameReplica = (a: typeof original, ai: number, b: typeof original, bi: number) => idAt(a, ai) === idAt(b, bi);
+  let checked = 0;
   for (const [index, run] of corrupted.runs.entries()) {
     if (!run.tombstone) {
       continue;
@@ -120,7 +126,7 @@ test("the tombstoned runs keep their original style timestamp instead of being r
     // The run this piece came from, in the document a reader still holds.
     const source = original.runs.find(
       (candidate) =>
-        candidate.coord.replica === run.coord.replica &&
+        sameReplica(original, candidate.coord.replica, corrupted, run.coord.replica) &&
         run.coord.clock >= candidate.coord.clock &&
         run.coord.clock < candidate.coord.clock + candidate.length,
     );
@@ -130,7 +136,9 @@ test("the tombstoned runs keep their original style timestamp instead of being r
 
     // The corruption: our tombstone claims exactly the timestamp the holder's
     // own copy of this run carries. It ties, so it cannot out-rank it.
-    assert.deepEqual(run.anchor, source.anchor, `run ${index} should have kept its original stamp`);
+    assert.equal(run.anchor.clock, source.anchor.clock, `run ${index} should have kept its original stamp`);
+    assert.ok(sameReplica(corrupted, run.anchor.replica, original, source.anchor.replica), `run ${index} stamp holder`);
+    checked += 1;
 
     // And that is strictly weaker than what the real rule would have stamped:
     // (us, max(old clock + 8, floor)) - the deletion bias from PR 9/12.
@@ -145,6 +153,8 @@ test("the tombstoned runs keep their original style timestamp instead of being r
       `run ${index}'s corrupt stamp (${run.anchor.clock}) should lose to the correct one (${properlyStamped.anchor.clock})`,
     );
   }
+  assert.ok(checked > 0, "the fixture must exercise at least one live run's tombstone");
+  assert.equal(checked, tiedRuns);
 });
 
 test("the style counter is rolled back with the stamps", () => {

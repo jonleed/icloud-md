@@ -97,6 +97,10 @@ export function buildTiedAnchorDeletion(originalRaw: Uint8Array, newText: string
     }
   }
 
+  // Keyed by replica UUID, not table index: a replica joining the document
+  // is inserted in sorted UUID order (upstream #54), which renumbers the
+  // indexes of every replica after it.
+  const beforeIds = doc.replicas.map((replica) => hex(replica.id));
   const before = snapshotRuns(doc);
   const beforeCounters = new Map(doc.replicas.map((replica) => [hex(replica.id), [...replica.counters]] as const));
   // What `ensureReplica` seeds a replica joining this document with - the
@@ -110,18 +114,22 @@ export function buildTiedAnchorDeletion(originalRaw: Uint8Array, newText: string
   // Revert the stamps, and only the stamps.
   const tiedAnchors: RunCoord[] = [];
   const correctAnchors: RunCoord[] = [];
+  const afterIds = doc.replicas.map((replica) => hex(replica.id));
+  // Pre-edit index of the replica now at `index` (0 stays 0: origin/sentinel).
+  const toBefore = (index: number) => (index === 0 ? 0 : beforeIds.indexOf(afterIds[index - 1] ?? "") + 1);
+  const toAfter = (index: number) => (index === 0 ? 0 : afterIds.indexOf(beforeIds[index - 1] ?? "") + 1);
   for (const run of doc.runs) {
     if (!run.tombstone) {
       continue;
     }
-    const original = coveringRun(before, run.coord);
+    const original = coveringRun(before, { replica: toBefore(run.coord.replica), clock: run.coord.clock });
     if (original === undefined || original.tombstone) {
       // Already dead before this edit (an earlier deletion), or not a run
       // this edit touched. Either way its stamp is not ours to change.
       continue;
     }
     correctAnchors.push({ ...run.anchor });
-    run.anchor = { ...original.anchor };
+    run.anchor = { replica: toAfter(original.anchor.replica), clock: original.anchor.clock };
     tiedAnchors.push({ ...run.anchor });
   }
 

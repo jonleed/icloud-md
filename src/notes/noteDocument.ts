@@ -802,11 +802,23 @@ function visibleLengthFrom(runs: readonly TextRun[], startIndex: number): number
 }
 
 /** Returns the 1-based replica-table index for `replicaId`, adding a new
- * entry if this document has never seen our replica. */
+ * entry if this document has never seen our replica.
+ *
+ * Apple's clients keep the replica table sorted by UUID bytes and re-sort it
+ * on load *without* renumbering the index-based references into it (every
+ * substring's `charID` and `timestamp` replica). An entry appended out of
+ * order therefore re-attributes every later replica's text to a different
+ * UUID on the device, which then merges it as new text and shows the note
+ * body twice (upstream issue #54; reproduced on an iPhone 2026-10-29). So a
+ * joining replica goes in at its sorted position and every reference at or
+ * past that position shifts up by one. */
 function ensureReplica(doc: NoteDocument, replicaId: Uint8Array): number {
   const existing = doc.replicas.findIndex((replica) => bytesEqual(replica.id, replicaId));
   if (existing !== -1) {
     return existing + 1;
+  }
+  if (!replicaTableIsSorted(doc.replicas)) {
+    throw new Error("this note's replica table is not sorted by UUID - refusing to edit it");
   }
   // A replica joining an existing document initializes both clocks to the
   // maxima observed across the table - the 2026-07-17 formatting-evolution
@@ -817,8 +829,32 @@ function ensureReplica(doc: NoteDocument, replicaId: Uint8Array): number {
   // exactly the captured create shape.
   const maxTextClock = Math.max(0, ...doc.replicas.map((replica) => replica.counters[0] ?? 0));
   const maxOpClock = Math.max(0, ...doc.replicas.map((replica) => replica.counters[1] ?? 0));
-  doc.replicas.push({ id: replicaId, counters: [maxTextClock, maxOpClock] });
-  return doc.replicas.length;
+  let position = doc.replicas.findIndex((replica) => compareBytes(replicaId, replica.id) < 0);
+  if (position === -1) {
+    position = doc.replicas.length;
+  }
+  const newIndex = position + 1;
+  for (const run of doc.runs) {
+    if (run.coord.replica >= newIndex) {
+      run.coord.replica += 1;
+    }
+    if (run.anchor.replica >= newIndex) {
+      run.anchor.replica += 1;
+    }
+  }
+  doc.replicas.splice(position, 0, { id: replicaId, counters: [maxTextClock, maxOpClock] });
+  return newIndex;
+}
+
+export function replicaTableIsSorted(replicas: readonly ReplicaEntry[]): boolean {
+  for (let i = 1; i < replicas.length; i += 1) {
+    const previous = replicas[i - 1];
+    const current = replicas[i];
+    if (previous && current && compareBytes(previous.id, current.id) >= 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**

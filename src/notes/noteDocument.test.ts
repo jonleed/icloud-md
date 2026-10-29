@@ -676,3 +676,88 @@ test("appending after a trailing embed grows a fresh run, not the embed's", () =
   assert.equal(doc.attributeRuns[2]?.attachmentInfo, undefined);
   assert.equal(reencodeAndDecode(doc), "a￼ tail");
 });
+
+// Upstream issue #54: Apple keeps the replica table sorted by UUID bytes and
+// re-sorts it on load without renumbering charIDs, so a replica appended out
+// of order makes the iPhone see every later replica's text as new and show
+// the note body twice. Reproduced live 2026-10-29 (iPhone-authored note,
+// our replica 37ae.. sorting before the phone's 8c7e..).
+const REPLICA_LOW = new Uint8Array(16).fill(0x11);
+
+test("a joining replica that sorts first is inserted at index 1 and existing references are renumbered", () => {
+  const doc = simpleDocument("Hello");
+  assert.equal(applyTextEdit(doc, "Hello!", { replicaId: REPLICA_LOW }), true);
+
+  assert.deepEqual(
+    doc.replicas.map((replica) => replica.id[0]),
+    [0x11, 0xaa],
+  );
+  // Replica A's text now lives at index 2; ours is index 1.
+  const contentRuns = doc.runs.filter((run) => run.length > 0);
+  assert.deepEqual(
+    contentRuns.map((run) => [run.coord.replica, run.coord.clock, run.length]),
+    [
+      [2, 0, 5],
+      [1, 5, 1],
+    ],
+  );
+  assert.equal(contentRuns[0]?.anchor.replica, 2);
+  // The origin and end sentinel keep replica 0.
+  assert.equal(doc.runs[0]?.coord.replica, 0);
+  assert.equal(doc.runs[doc.runs.length - 1]?.coord.replica, 0);
+  assert.equal(visibleText(doc), "Hello!");
+  assert.equal(reencodeAndDecode(doc), "Hello!");
+  validateDocumentInvariants(doc);
+});
+
+test("a joining replica lands between existing ones in sorted position", () => {
+  const doc = makeDocument(
+    "ab",
+    [
+      { coord: { replica: 1, clock: 0 }, length: 1, anchor: { replica: 1, clock: 0 }, tombstone: false, sequence: [2] },
+      { coord: { replica: 2, clock: 0 }, length: 1, anchor: { replica: 2, clock: 0 }, tombstone: false, sequence: [3] },
+    ],
+    [1, 1],
+  );
+  const middle = new Uint8Array(16).fill(0xb0);
+  assert.equal(applyTextEdit(doc, "abc", { replicaId: middle }), true);
+  assert.deepEqual(
+    doc.replicas.map((replica) => replica.id[0]),
+    [0xaa, 0xb0, 0xbb],
+  );
+  const contentRuns = doc.runs.filter((run) => run.length > 0);
+  assert.deepEqual(
+    contentRuns.map((run) => [run.coord.replica, run.anchor.replica]),
+    [
+      [1, 1],
+      [3, 3],
+      [2, contentRuns[2]?.anchor.replica ?? -1],
+    ],
+  );
+  assert.equal(contentRuns[2]?.coord.replica, 2);
+  assert.equal(visibleText(doc), "abc");
+  validateDocumentInvariants(doc);
+});
+
+test("a joining replica that sorts last keeps the old append behavior", () => {
+  const doc = simpleDocument("Hello");
+  assert.equal(applyTextEdit(doc, "Hello!", { replicaId: REPLICA_B }), true);
+  assert.deepEqual(
+    doc.replicas.map((replica) => replica.id[0]),
+    [0xaa, 0xbb],
+  );
+  assert.deepEqual(doc.runs[1]?.coord, { replica: 1, clock: 0 });
+});
+
+test("editing a document whose replica table is already unsorted is refused", () => {
+  const doc = simpleDocument("Hello");
+  doc.replicas.unshift({ id: REPLICA_B, counters: [0, 0] });
+  // Re-point the content run at A, now index 2, so only the ordering is wrong.
+  for (const run of doc.runs) {
+    if (run.coord.replica === 1) {
+      run.coord.replica = 2;
+      run.anchor.replica = 2;
+    }
+  }
+  assert.throws(() => applyTextEdit(doc, "Hello!", { replicaId: REPLICA_LOW }), /replica table is not sorted/);
+});
