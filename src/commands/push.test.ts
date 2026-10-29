@@ -668,16 +668,26 @@ test("buildPushPlan refuses an untracked file with conflict markers locally - sa
     assert.match(entries[0]?.reason ?? "", /conflict markers/);
   }));
 
-test("buildPushPlan refuses an untracked file referencing attachments locally", () =>
+test("buildPushPlan lets a new note with an image in an own folder proceed to the network", () =>
   withTempDir(async (dir) => {
+    // New notes may carry images now; the UnboundAccountError proves it got
+    // past every local gate. (What gets built is pushCreateImages.test.ts.)
     await writeCloneState(dir, emptyState());
     await writeVaultFile(dir, "Notes/HasAttachment.md", "Look:\n\n![pic](attachments/pic.jpg)\n");
+
+    await assert.rejects(() => buildPushPlan(dir), UnboundAccountError);
+  }));
+
+test("buildPushPlan still refuses a new note with an image in a shared folder, locally", () =>
+  withTempDir(async (dir) => {
+    await writeCloneState(dir, emptyState());
+    await writeVaultFile(dir, "Pat/Shared Recipes/HasAttachment.md", "Look:\n\n![pic](attachments/pic.jpg)\n");
 
     const { entries } = await buildPushPlan(dir);
 
     assert.equal(entries.length, 1);
     assert.equal(entries[0]?.resolution, "refused");
-    assert.match(entries[0]?.reason ?? "", /attachments/);
+    assert.match(entries[0]?.reason ?? "", /own folders/);
   }));
 
 test("buildPushPlan ignores a file already tracked in state.notes", () =>

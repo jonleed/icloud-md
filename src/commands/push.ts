@@ -705,6 +705,11 @@ export async function buildPushPlan(
   // untracked file passes the same local refusal gates a modified one does
   // - a brand-new file containing conflict markers or unparseable content
   // is just as unsendable as an edited one containing them.
+  // Every image file already tracked as some note's attachment, plus every
+  // file a new image claims during this plan. A file belongs to exactly one
+  // attachment, as pull lays them out: if two notes shared one, a later pull
+  // removing the image from either would delete the file the other uses.
+  const claimedAttachmentFiles = new Set(Object.values(state.attachments ?? {}).map((attachment) => attachment.file));
   const createCandidates: { file: string; localText: string; folderRecordName: string; sharedZoneOwner?: string | undefined }[] = [];
   for (const { file, localText } of untracked) {
     if (claimedByMove.has(file) || refusedByIdClaim.has(file)) {
@@ -788,12 +793,12 @@ export async function buildPushPlan(
       });
       continue;
     }
-    if (hasAttachmentReference(localText)) {
+    if (hasAttachmentReference(localText) && info.sharedZoneOwner !== undefined) {
       entries.push({
         kind: "create",
         file,
         resolution: "refused",
-        reason: 'contains an "attachments/..." reference, but this tool can\'t upload new attachments - remove it first.',
+        reason: 'contains an "attachments/..." image, but images can only be added to new notes in your own folders for now',
       });
       continue;
     }
@@ -1102,52 +1107,45 @@ export async function buildPushPlan(
     // markdown parses into plain text + formatting; the initial document
     // carries the text and the same reconciler `push` edits with applies
     // the formatting (Step 2 of the formatting plan).
-    let payloadBase64: string;
-    let plainText: string;
+    // Generated while planning, not at execute time, because a new image's
+    // Attachment record has to name the note it belongs to.
+    const recordName = randomUUID();
+    let newAttachments: ResolvedNewAttachment[] = [];
+    let sourceText = localText;
+    if (hasAttachmentReference(localText)) {
+      const plan = planEmbedRepresentations(localText, [], new Set(), new Map());
+      if (!plan.ok) {
+        entries.push({ kind: "create", file, resolution: "refused", reason: plan.reason });
+        continue;
+      }
+      let refusal: string | undefined;
+      const resolved = await resolveNewAttachments(targetDir, file, plan.newAttachments, (reason) => {
+        refusal = reason;
+        return undefined;
+      });
+      if (!resolved) {
+        entries.push({ kind: "create", file, resolution: "refused", reason: refusal ?? "an image couldn't be prepared" });
+        continue;
+      }
+      const shared = takeAttachmentFiles(claimedAttachmentFiles, resolved);
+      if (shared !== undefined) {
+        entries.push({ kind: "create", file, resolution: "refused", reason: sharedAttachmentReason(shared) });
+        continue;
+      }
+      newAttachments = resolved;
+      sourceText = plan.reconstructedBodyText;
+    }
+    let built: ReturnType<typeof prepareNoteCreate>;
     try {
-      const parsed = parseLocalMarkdown(localText);
-      if (parsed.status !== "ok") {
-        entries.push({ kind: "create", file, resolution: "refused", reason: parsed.reason });
-        continue;
-      }
-      // A brand-new note has no remote paragraph to preserve, so under
-      // filename-as-title its title can only come from the file name - and
-      // does, in plain Title style. Everything downstream (the built
-      // document, the verification, and `plainText`) has to see the
-      // reconstructed note rather than the body it was parsed from.
-      const desired =
-        titleMode === "filename"
-          ? restoreTitleParagraphText(titleParagraphFromFilename(titleExpressedByFile(file, recordedTitles)), parsed.paragraphs)
-          : parsed;
-      const doc = buildInitialNoteDocument(desired.text, replicaIdBytes);
-      const reconciled = reconcileNoteFormat(doc, desired.paragraphs, replicaIdBytes);
-      if (!reconciled.ok) {
-        entries.push({ kind: "create", file, resolution: "refused", reason: reconciled.reason });
-        continue;
-      }
-      const compressed = compressNoteDocument(encodeNoteDocument(doc));
-      const rebuiltString = decodeNoteString(compressed);
-      const rebuiltFormat = decodeNoteFormat(rebuiltString.string, rebuiltString.attributeRun);
-      if (
-        rebuiltString.string !== desired.text ||
-        rebuiltFormat.status !== "ok" ||
-        !formatsRoundTripEqual(rebuiltFormat.paragraphs, desired.paragraphs)
-      ) {
-        entries.push({
-          kind: "create",
-          file,
-          resolution: "refused",
-          reason: "built document failed decode verification - refusing to create",
-        });
-        continue;
-      }
-      payloadBase64 = compressed.toString("base64");
-      plainText = desired.text;
+      built = prepareNoteCreate(sourceText, file, titleMode, recordedTitles, replicaIdBytes, newAttachments);
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      entries.push({ kind: "create", file, resolution: "refused", reason: message });
+      built = { ok: false, reason: cause instanceof Error ? cause.message : String(cause) };
+    }
+    if (!built.ok) {
+      entries.push({ kind: "create", file, resolution: "refused", reason: built.reason });
       continue;
     }
+    const { payloadBase64, plainText } = built;
 
     const fileStat = await stat(path.join(targetDir, file));
     const modificationDateMs = Math.round(fileStat.mtimeMs);
@@ -1159,25 +1157,100 @@ export async function buildPushPlan(
         if (failedFolders.has(folderRecordName)) {
           return { succeeded: false, message: `${file}: skipped - the folder it belongs in could not be created` };
         }
-        // Client-generated lowercase-UUID recordName, matching the captured
-        // create (the live vault also has uppercase ones, so casing likely
-        // doesn't matter - but lowercase is what the capture shows).
-        const recordName = randomUUID();
+        // Client-generated lowercase-UUID recordName (generated while
+        // planning), matching the captured create (the live vault also has
+        // uppercase ones, so casing likely doesn't matter - but lowercase is
+        // what the capture shows).
         const zone = noteZone(sharedZoneOwner);
-        const result = await createNoteRecord(
-          session,
-          ckdatabasewsUrl,
-          dsid,
-          zone.database,
-          zone.zoneID,
-          recordName,
-          buildNoteCreateFields(payloadBase64, plainText, modificationDateMs, folderRecordName, sharedZoneOwner),
-          // A shared-folder create byte-matches the 2026-07-17 capture: the
-          // record-hierarchy parent at the folder is what makes the new
-          // note a member of the folder's share. The private shape (no
-          // parent) stays exactly as live-verified.
-          sharedZoneOwner !== undefined ? { parentRecordName: folderRecordName, createShortGUID: true } : {},
-        );
+        const noteFields = buildNoteCreateFields(payloadBase64, plainText, modificationDateMs, folderRecordName, sharedZoneOwner);
+        let result: Awaited<ReturnType<typeof createNoteRecord>>;
+        if (newAttachments.length === 0) {
+          result = await createNoteRecord(
+            session,
+            ckdatabasewsUrl,
+            dsid,
+            zone.database,
+            zone.zoneID,
+            recordName,
+            noteFields,
+            // A shared-folder create byte-matches the 2026-07-17 capture: the
+            // record-hierarchy parent at the folder is what makes the new
+            // note a member of the folder's share. The private shape (no
+            // parent) stays exactly as live-verified.
+            sharedZoneOwner !== undefined ? { parentRecordName: folderRecordName, createShortGUID: true } : {},
+          );
+        } else {
+          // Images upload first; then the note and every image's Media and
+          // Attachment records go in one atomic records/modify, so no device
+          // ever sees a note pointing at an image that doesn't exist yet.
+          const batch: RecordUpdate[] = [
+            { operationType: "create", recordName, recordType: "Note", recordChangeTag: "", fields: noteFields },
+          ];
+          const nowMs = Date.now();
+          const uploadedChecksums = new Map<string, string>();
+          for (const attachment of newAttachments) {
+            const singleFile = await uploadAsset(
+              session,
+              ckdatabasewsUrl,
+              dsid,
+              zone.database,
+              zone.zoneID,
+              { recordType: "Media", fieldName: "Asset", recordName: attachment.mediaRecordName },
+              attachment.bytes,
+            );
+            uploadedChecksums.set(attachment.mediaRecordName, String(singleFile.fileChecksum ?? ""));
+            batch.push(
+              {
+                operationType: "create",
+                recordName: attachment.mediaRecordName,
+                recordType: "Media",
+                recordChangeTag: "",
+                fields: buildMediaFields(path.posix.basename(attachment.file), singleFile),
+                parentRecordName: recordName,
+              },
+              {
+                operationType: "create",
+                recordName: attachment.attachmentRecordName,
+                recordType: "Attachment",
+                recordChangeTag: "",
+                fields: buildImageAttachmentFields({
+                  noteRecordName: recordName,
+                  mediaRecordName: attachment.mediaRecordName,
+                  zoneName: zone.zoneID.zoneName,
+                  uti: attachment.uti,
+                  fileSize: attachment.bytes.length,
+                  width: attachment.width,
+                  height: attachment.height,
+                  nowMs,
+                }),
+                parentRecordName: recordName,
+              },
+            );
+          }
+          const results = await updateRecords(session, ckdatabasewsUrl, dsid, zone.database, zone.zoneID, batch);
+          const failure = results.find((entryResult) => !entryResult.ok);
+          if (failure && !failure.ok) {
+            const detail = failure.reason ? ` (${failure.reason})` : "";
+            return { succeeded: false, message: `${file}: server rejected the create: ${failure.serverErrorCode}${detail}` };
+          }
+          const created = results.find((entryResult) => entryResult.ok && entryResult.record.recordName === recordName);
+          if (!created) {
+            return { succeeded: false, message: `${file}: the server returned no record for the new note` };
+          }
+          result = created;
+          state.attachments ??= {};
+          for (const attachment of newAttachments) {
+            const media = results.find((entryResult) => entryResult.ok && entryResult.record.recordName === attachment.mediaRecordName);
+            const asset = media?.ok ? (media.record.fields.Asset?.value as { fileChecksum?: unknown } | undefined) : undefined;
+            state.attachments[attachment.attachmentRecordName] = {
+              file: attachment.file,
+              mediaRecordName: attachment.mediaRecordName,
+              mediaFileChecksum:
+                typeof asset?.fileChecksum === "string" ? asset.fileChecksum : (uploadedChecksums.get(attachment.mediaRecordName) ?? ""),
+              noteRecordName: recordName,
+            };
+          }
+        }
         if (!result.ok) {
           const detail = result.reason ? ` (${result.reason})` : "";
           return { succeeded: false, message: `${file}: server rejected the create: ${result.serverErrorCode}${detail}` };
@@ -1192,14 +1265,20 @@ export async function buildPushPlan(
           folderRecordName,
           sharedZoneOwner,
         };
-        await writeBaseCopy(targetDir, recordName, localText);
+        // New image links take the exact form pull renders, so the next push
+        // matches them as this note's existing attachments.
+        await writeBaseCopy(targetDir, recordName, canonicalizeNewLinks(localText, newAttachments));
         // Stamp the note's new identity into the file it came from, so the
         // next rename resolves exactly instead of by heuristic. This is also
         // what re-homes a *copied* file: it arrived carrying the original's
         // id, and leaves carrying its own.
         const filePath = path.join(targetDir, file);
         const { frontmatter, body } = splitFrontmatter(await readFile(filePath, "utf-8"), { filenameAsTitle });
-        await writeFile(filePath, joinFrontmatter(setNoteId(frontmatter, recordName), body), "utf-8");
+        await writeFile(
+          filePath,
+          joinFrontmatter(setNoteId(frontmatter, recordName), canonicalizeNewLinks(body, newAttachments)),
+          "utf-8",
+        );
         await applyNoteFileTimes(path.join(targetDir, file), result.record);
         const textValue = result.record.fields.TextDataEncrypted?.value;
         if (typeof textValue === "string") {
@@ -1347,6 +1426,11 @@ export async function buildPushPlan(
           reason: stripFilePrefix(newRefusal ?? "refused", entry.file),
         });
       }
+      continue;
+    }
+    const sharedFile = prepared.newAttachments ? takeAttachmentFiles(claimedAttachmentFiles, prepared.newAttachments) : undefined;
+    if (sharedFile !== undefined) {
+      entries.push({ kind: "update", file: entry.file, resolution: "refused", reason: sharedAttachmentReason(sharedFile) });
       continue;
     }
     if (prepared.updates.length === 0) {
@@ -1714,7 +1798,10 @@ async function prepareEmbedCandidate(
     summary.refused.push(`${entry.file}: ${plan.reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
     return undefined;
   }
-  const newAttachments = await resolveNewAttachments(targetDir, entry, plan.newAttachments, summary);
+  const newAttachments = await resolveNewAttachments(targetDir, entry.file, plan.newAttachments, (reason) => {
+    summary.refused.push(`${entry.file}: ${reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
+    return undefined;
+  });
   if (newAttachments === undefined) {
     return undefined;
   }
@@ -1903,6 +1990,101 @@ function canonicalizeNewLinks(text: string, attachments: readonly PreparedNewAtt
   return out;
 }
 
+/**
+ * Builds and decode-verifies a brand-new note's document: the text, its
+ * formatting, and one attachment run per new image (in the order the
+ * placeholders appear). Exported for tests; push calls it while planning.
+ */
+export function prepareNoteCreate(
+  sourceText: string,
+  file: string,
+  titleMode: TitleMode,
+  recordedTitles: ReadonlyMap<string, string>,
+  replicaIdBytes: Uint8Array,
+  newAttachments: readonly Pick<ResolvedNewAttachment, "attachmentRecordName" | "uti">[],
+): { ok: true; payloadBase64: string; plainText: string } | { ok: false; reason: string } {
+  const parsed = parseLocalMarkdown(sourceText);
+  if (parsed.status !== "ok") {
+    return { ok: false, reason: parsed.reason };
+  }
+  // A brand-new note has no remote paragraph to preserve, so under
+  // filename-as-title its title can only come from the file name - and
+  // does, in plain Title style. Everything downstream (the built
+  // document, the verification, and `plainText`) has to see the
+  // reconstructed note rather than the body it was parsed from.
+  const desired =
+    titleMode === "filename"
+      ? restoreTitleParagraphText(titleParagraphFromFilename(titleExpressedByFile(file, recordedTitles)), parsed.paragraphs)
+      : parsed;
+  const doc = buildInitialNoteDocument(desired.text, replicaIdBytes);
+  if (newAttachments.length > 0) {
+    const placeholderIndexes: number[] = [];
+    for (let i = 0; i < doc.text.length; i += 1) {
+      if (doc.text[i] === OBJECT_REPLACEMENT_CHARACTER) {
+        placeholderIndexes.push(i);
+      }
+    }
+    if (placeholderIndexes.length !== newAttachments.length) {
+      return { ok: false, reason: "couldn't place every image in the new note" };
+    }
+    attachNewEmbeds(
+      doc,
+      newAttachments.map((attachment, i) => ({
+        index: placeholderIndexes[i] ?? -1,
+        attachmentIdentifier: attachment.attachmentRecordName,
+        typeUti: attachment.uti,
+      })),
+      Math.floor(Date.now() / 1000),
+    );
+  }
+  const reconciled = reconcileNoteFormat(doc, desired.paragraphs, replicaIdBytes);
+  if (!reconciled.ok) {
+    return { ok: false, reason: reconciled.reason };
+  }
+  if (!replicaTableIsSorted(doc.replicas)) {
+    return { ok: false, reason: "built document's replica table isn't sorted" };
+  }
+  const compressed = compressNoteDocument(encodeNoteDocument(doc));
+  const expectedSlots: EmbedSlot[] = newAttachments.map((attachment) => ({
+    kind: "attachment",
+    ref: { attachmentIdentifier: attachment.attachmentRecordName, typeUti: attachment.uti },
+  }));
+  if (!embedSlotsEqual(decodeNoteEmbedSlots(compressed) ?? [], expectedSlots)) {
+    return { ok: false, reason: "built document failed embed-structure verification" };
+  }
+  const rebuiltString = decodeNoteString(compressed);
+  const rebuiltFormat = decodeNoteFormat(rebuiltString.string, rebuiltString.attributeRun);
+  if (
+    rebuiltString.string !== desired.text ||
+    rebuiltFormat.status !== "ok" ||
+    !formatsRoundTripEqual(rebuiltFormat.paragraphs, desired.paragraphs)
+  ) {
+    return { ok: false, reason: "built document failed decode verification - refusing to create" };
+  }
+  return { ok: true, payloadBase64: compressed.toString("base64"), plainText: desired.text };
+}
+
+/** Claims each new image's file, or returns the first one that's taken. */
+export function takeAttachmentFiles(claimed: Set<string>, attachments: readonly { file: string }[]): string | undefined {
+  // Checked against a copy first, so a refused note claims nothing - and the
+  // same new file linked twice in one note is caught too.
+  const next = new Set(claimed);
+  for (const attachment of attachments) {
+    if (next.has(attachment.file)) {
+      return attachment.file;
+    }
+    next.add(attachment.file);
+  }
+  for (const attachment of attachments) {
+    claimed.add(attachment.file);
+  }
+  return undefined;
+}
+
+function sharedAttachmentReason(file: string): string {
+  return `${file} is already another note's image - copy it under a new name to use it here too`;
+}
+
 interface ResolvedNewAttachment extends PreparedNewAttachment {
   ordinal: number;
   uti: string;
@@ -1918,15 +2100,11 @@ interface ResolvedNewAttachment extends PreparedNewAttachment {
  */
 async function resolveNewAttachments(
   targetDir: string,
-  entry: CloneStateNoteEntry,
+  noteFile: string,
   links: readonly NewAttachmentLink[],
-  summary: PushSummary,
+  refuse: (reason: string) => undefined,
 ): Promise<ResolvedNewAttachment[] | undefined> {
-  const refuse = (reason: string): undefined => {
-    summary.refused.push(`${entry.file}: ${reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
-    return undefined;
-  };
-  const noteDir = path.posix.dirname(entry.file.split(path.sep).join("/"));
+  const noteDir = path.posix.dirname(noteFile.split(path.sep).join("/"));
   const resolved: ResolvedNewAttachment[] = [];
   for (const link of links) {
     if (!link.isImage) {
