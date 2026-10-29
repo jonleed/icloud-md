@@ -100,6 +100,83 @@ test("a file attachment tracked from pull keeps the read-only refusal", () => {
   expectRefusal(result, /file attachment/);
 });
 
+const IMAGE_SLOT: EmbedSlot = { kind: "attachment", ref: { attachmentIdentifier: "IMG-1", typeUti: "public.jpeg" } };
+const PDF_SLOT: EmbedSlot = { kind: "attachment", ref: { attachmentIdentifier: "PDF-1", typeUti: "com.adobe.pdf" } };
+const LINKS = new Map([
+  ["IMG-1", "attachments/photo 1.jpeg"],
+  ["PDF-1", "attachments/doc.pdf"],
+]);
+const IMAGE_LINK = "![photo 1.jpeg](attachments/photo%201.jpeg)";
+const PDF_LINK = "[doc.pdf](attachments/doc.pdf)";
+
+test("a verbatim tracked image link maps back to its placeholder; prose around it is editable", () => {
+  const localText = `Title\nedited before\n${IMAGE_LINK}\nedited after`;
+  const plan = expectOk(planEmbedRepresentations(localText, [IMAGE_SLOT], new Set(LINKS.keys()), LINKS));
+  assert.equal(plan.reconstructedBodyText, `Title\nedited before\n${OBJECT_REPLACEMENT_CHARACTER}\nedited after`);
+});
+
+test("non-image attachments use their plain-link form", () => {
+  const localText = `T\n${PDF_LINK}\n`;
+  const plan = expectOk(planEmbedRepresentations(localText, [PDF_SLOT], new Set(LINKS.keys()), LINKS));
+  assert.equal(plan.reconstructedBodyText, `T\n${OBJECT_REPLACEMENT_CHARACTER}\n`);
+});
+
+test("file links, markers and tables interleave in document order", () => {
+  const table = renderMarkdownTable([["A"]]);
+  const localText = `T\n${IMAGE_LINK}\n${GALLERY_MARKER}\n${table}\n${PDF_LINK}`;
+  const plan = expectOk(
+    planEmbedRepresentations(localText, [IMAGE_SLOT, GALLERY_SLOT, TABLE_SLOT, PDF_SLOT], new Set(LINKS.keys()), LINKS),
+  );
+  const P = OBJECT_REPLACEMENT_CHARACTER;
+  assert.equal(plan.reconstructedBodyText, `T\n${P}\n${P}\n${P}\n${P}`);
+  assert.equal(plan.tables.length, 1);
+});
+
+test("the same file embedded twice binds both slots in order", () => {
+  const localText = `T\n${IMAGE_LINK}\nmid\n${IMAGE_LINK}`;
+  const plan = expectOk(planEmbedRepresentations(localText, [IMAGE_SLOT, IMAGE_SLOT], new Set(LINKS.keys()), LINKS));
+  assert.equal(plan.reconstructedBodyText, `T\n${OBJECT_REPLACEMENT_CHARACTER}\nmid\n${OBJECT_REPLACEMENT_CHARACTER}`);
+});
+
+test("a deleted image link refuses the push", () => {
+  expectRefusal(
+    planEmbedRepresentations("T\nprose only", [IMAGE_SLOT], new Set(LINKS.keys()), LINKS),
+    /attachment link .* is missing, edited, or out of order/,
+  );
+});
+
+test("an edited image link (renamed alt text) refuses the push", () => {
+  expectRefusal(
+    planEmbedRepresentations("T\n![renamed](attachments/photo%201.jpeg)", [IMAGE_SLOT], new Set(LINKS.keys()), LINKS),
+    /attachment link/,
+  );
+});
+
+test("reordered attachment links refuse the push", () => {
+  expectRefusal(
+    planEmbedRepresentations(`T\n${PDF_LINK}\n${IMAGE_LINK}`, [IMAGE_SLOT, PDF_SLOT], new Set(LINKS.keys()), LINKS),
+    /attachment link/,
+  );
+});
+
+test("a duplicated or hand-typed extra attachment link refuses the push", () => {
+  expectRefusal(
+    planEmbedRepresentations(`T\n${IMAGE_LINK}\n${IMAGE_LINK}`, [IMAGE_SLOT], new Set(LINKS.keys()), LINKS),
+    /extra "attachments\/\.\.\." link/,
+  );
+  expectRefusal(
+    planEmbedRepresentations(`T\n${IMAGE_LINK}\n![new](attachments/new.png)`, [IMAGE_SLOT], new Set(LINKS.keys()), LINKS),
+    /extra "attachments\/\.\.\." link/,
+  );
+});
+
+test("CRLF line endings still match the tracked link", () => {
+  const plan = expectOk(
+    planEmbedRepresentations(`T\r\n${IMAGE_LINK}\r\nafter`, [IMAGE_SLOT], new Set(LINKS.keys()), LINKS),
+  );
+  assert.equal(plan.reconstructedBodyText, `T\n${OBJECT_REPLACEMENT_CHARACTER}\nafter`);
+});
+
 test("an identified non-table slot with no marker and no tracked file refuses with the missing-marker reason", () => {
   const fileSlot: EmbedSlot = { kind: "attachment", ref: { attachmentIdentifier: "FILE-1", typeUti: "public.jpeg" } };
   expectRefusal(planEmbedRepresentations("prose only", [fileSlot], NO_FILES), /marker.*is missing/);

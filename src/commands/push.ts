@@ -1298,10 +1298,17 @@ export async function buildPushPlan(
     const summary: PushSummary = { conflicts: [], refused: [] };
     const conflictsBefore = summary.conflicts.length;
     const refusedBefore = summary.refused.length;
-    const trackedFileAttachmentIds = new Set(
+    // Attachment recordName -> the note-relative link `pull` wrote for its
+    // downloaded file, computed exactly as `attachmentSync.ts` does
+    // (`path.posix.relative(noteDir, file)`) so push can match it verbatim.
+    const noteDir = path.posix.dirname(entry.file.split(path.sep).join("/"));
+    const trackedFileAttachmentIds = new Map(
       Object.entries(state.attachments ?? {})
         .filter(([, attachment]) => attachment.noteRecordName === recordName)
-        .map(([attachmentRecordName]) => attachmentRecordName),
+        .map(([attachmentRecordName, attachment]) => [
+          attachmentRecordName,
+          path.posix.relative(noteDir, attachment.file),
+        ]),
     );
     const prepared = await prepareUpdate(
       session,
@@ -1534,7 +1541,7 @@ async function prepareUpdate(
   record: CloudKitRecord,
   entry: CloneStateNoteEntry,
   localText: string,
-  trackedFileAttachmentIds: ReadonlySet<string>,
+  trackedFileAttachmentIds: ReadonlyMap<string, string>,
   replicaId: Uint8Array,
   modificationDateMs: number,
   titleMode: TitleMode,
@@ -1636,13 +1643,18 @@ async function prepareEmbedCandidate(
   classified: OkNoteRecordResult,
   entry: CloneStateNoteEntry,
   localText: string,
-  trackedFileAttachmentIds: ReadonlySet<string>,
+  trackedFileAttachmentIds: ReadonlyMap<string, string>,
   replicaId: Uint8Array,
   modificationDateMs: number,
   summary: PushSummary,
   requestedTitle?: string | undefined,
 ): Promise<PreparedCandidate | undefined> {
-  const plan = planEmbedRepresentations(localText, classified.embedSlots, trackedFileAttachmentIds);
+  const plan = planEmbedRepresentations(
+    localText,
+    classified.embedSlots,
+    new Set(trackedFileAttachmentIds.keys()),
+    trackedFileAttachmentIds,
+  );
   if (!plan.ok) {
     summary.refused.push(`${entry.file}: ${plan.reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
     return undefined;

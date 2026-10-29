@@ -12,7 +12,14 @@
  */
 
 import { findMarkdownTableBlocks, type MarkdownTableBlock } from "./markdownTable.js";
-import { isTableUti, OBJECT_REPLACEMENT_CHARACTER, type AttachmentReference, type EmbedSlot } from "./noteAttachments.js";
+import {
+  formatAttachmentMarkdown,
+  hasAttachmentReference,
+  isTableUti,
+  OBJECT_REPLACEMENT_CHARACTER,
+  type AttachmentReference,
+  type EmbedSlot,
+} from "./noteAttachments.js";
 import { formatEmbedMarker, parseEmbedMarkers } from "./unknownContent.js";
 
 /** One table slot matched to its local markdown block, in document order -
@@ -55,6 +62,14 @@ export function planEmbedRepresentations(
   localText: string,
   slots: readonly EmbedSlot[],
   trackedFileAttachmentIds: ReadonlySet<string>,
+  /** Attachment recordName -> the note-relative link path `pull` rendered
+   * for that downloaded file (`linkPath` in `attachmentSync.ts`). A tracked
+   * file attachment found here is matched like a marker: its rendered
+   * markdown (`formatAttachmentMarkdown`) must survive verbatim and in
+   * document order, and maps straight back to its original placeholder (its
+   * `attachmentInfo` run is never rewritten). Omitted, or missing an id,
+   * keeps the read-only refusal for that attachment. */
+  fileAttachmentLinkPaths: ReadonlyMap<string, string> = new Map(),
 ): EmbedRepresentationPlan {
   // Marker and table parsers use LF line positions. Normalize once before
   // discovery and splicing so every offset refers to the same string that
@@ -92,6 +107,24 @@ export function planEmbedRepresentations(
           end: block.endLine < lineStartOffsets.length ? (lineStartOffsets[block.endLine] ?? localText.length + 1) - 1 : localText.length,
           table: { ref: slot.ref, block },
         });
+        continue;
+      }
+      const linkPath = fileAttachmentLinkPaths.get(slot.ref.attachmentIdentifier);
+      if (linkPath !== undefined) {
+        const expectedLink = formatAttachmentMarkdown(slot.ref, linkPath);
+        // Search from just past the previous representation so a repeated
+        // link (the same file embedded twice) binds in document order.
+        const searchFrom = representations.length > 0 ? (representations[representations.length - 1]?.end ?? 0) : 0;
+        const start = localText.indexOf(expectedLink, searchFrom);
+        if (start === -1) {
+          return {
+            ok: false,
+            reason:
+              `the attachment link ${expectedLink} is missing, edited, or out of order - ` +
+              "attachment links must be left exactly as this tool wrote them",
+          };
+        }
+        representations.push({ start, end: start + expectedLink.length });
         continue;
       }
       if (trackedFileAttachmentIds.has(slot.ref.attachmentIdentifier)) {
@@ -166,6 +199,16 @@ export function planEmbedRepresentations(
   for (const representation of [...representations].reverse()) {
     reconstructed =
       reconstructed.slice(0, representation.start) + OBJECT_REPLACEMENT_CHARACTER + reconstructed.slice(representation.end);
+  }
+
+  // Any "attachments/..." link left over after every tracked one was spliced
+  // out is a duplicate or hand-typed reference with no uploaded file behind
+  // it; pushing it would silently become literal text.
+  if (hasAttachmentReference(reconstructed)) {
+    return {
+      ok: false,
+      reason: 'contains an extra "attachments/..." link this tool can\'t upload - remove it',
+    };
   }
 
   return {
