@@ -2,7 +2,7 @@ import type { CloudKitFieldValue, CloudKitRecord } from "../cloudkit/databaseCli
 import type { TitleMode } from "./cloneState.js";
 import { TRASH_FOLDER_RECORD_NAME } from "./encodeNoteRecord.js";
 import { decodeNoteEmbedSlots, OBJECT_REPLACEMENT_CHARACTER, type AttachmentReference, type EmbedSlot } from "./noteAttachments.js";
-import { decodeNoteFormat, formatsRoundTripEqual, trimTrailingWhitespace, type FormatParagraph } from "./noteFormat.js";
+import { decodeNoteFormat, formatsRoundTripEqual, isListKind, trimTrailingWhitespace, type FormatParagraph } from "./noteFormat.js";
 import { decodeNoteString } from "./noteText.js";
 import { parseNoteMarkdown } from "./parseNoteMarkdown.js";
 import { renderNoteMarkdown } from "./renderNoteMarkdown.js";
@@ -201,7 +201,11 @@ function classifyNoteBody(record: CloudKitRecord, options: ClassifyNoteOptions):
   // may carry trailing spaces the rendered file deliberately drops - a push
   // then deletes them remotely rather than the note going read-only here.
   const projectedText = projected.map((paragraph) => trimTrailingWhitespace(paragraph).text).join("\n");
-  if (reparsed.status !== "ok" || reparsed.text !== projectedText || !formatsRoundTripEqual(projected, reparsed.paragraphs)) {
+  if (
+    reparsed.status !== "ok" ||
+    reparsed.text !== projectedText ||
+    !(formatsRoundTripEqual(projected, reparsed.paragraphs) || onlyListIndentsFlatten(projected, reparsed.paragraphs))
+  ) {
     return {
       ...base,
       markdownText: bodyText,
@@ -212,6 +216,27 @@ function classifyNoteBody(record: CloudKitRecord, options: ClassifyNoteOptions):
   }
 
   return { ...base, markdownText: rendered, format: format.paragraphs, titleStripped: stripTitle, publishable: true };
+}
+
+/**
+ * Whether the round trip lost nothing but list depth: every difference is a
+ * list item read back *shallower* than the note has it. That is what an
+ * orphan indent does - an item indented with no parent item at the level
+ * above, which markdown can't nest - and losing it is accepted rather than
+ * locking the note. The file shows the depth markdown can express, and a
+ * push of an edit to the note writes that flattened depth back.
+ */
+function onlyListIndentsFlatten(projected: readonly FormatParagraph[], reparsed: readonly FormatParagraph[]): boolean {
+  if (projected.length !== reparsed.length) {
+    return false;
+  }
+  const flattened = projected.map((paragraph, i) => {
+    const back = reparsed[i]!;
+    return isListKind(paragraph.kind) && isListKind(back.kind) && back.indent < paragraph.indent
+      ? { ...paragraph, indent: back.indent }
+      : paragraph;
+  });
+  return formatsRoundTripEqual(flattened, reparsed);
 }
 
 /** Whether a note record is gone for sync purposes: a tombstone, marked

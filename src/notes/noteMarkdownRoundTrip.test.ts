@@ -142,6 +142,31 @@ test("explicit links round-trip; bare URLs stay plain text in both directions", 
   ]);
 });
 
+test("an empty checklist item followed by a body line keeps both", () => {
+  assertRoundTrips([p("body", "Title"), p("todoList", "", { done: false }), p("body", "after")]);
+  assertRoundTrips([p("body", "Title"), p("todoList", "", { done: true }), p("body", "after"), p("body", "more")]);
+  assertRoundTrips([p("todoList", "", { done: false, blockQuoteLevel: 1 }), p("body", "after")]);
+  assertRoundTrips([p("todoList", "", { done: false, blockQuoteLevel: 1 }), p("body", "after", { blockQuoteLevel: 1 })]);
+});
+
+test("an empty bullet directly under a body line stays a bullet, not a heading underline", () => {
+  assertRoundTrips([p("body", "Title"), p("body", "line"), p("bulletList", ""), p("body", "after")]);
+  assertRoundTrips([p("body", "line"), p("numberedList", "")]);
+  assertRoundTrips([p("body", "line", { blockQuoteLevel: 1 }), p("bulletList", "")]);
+});
+
+test("an empty nested list item under an item stays a list item", () => {
+  assertRoundTrips([p("body", "Title"), p("numberedList", "one"), p("numberedList", "", { indent: 1 })]);
+  assertRoundTrips([p("bulletList", "one"), p("bulletList", "", { indent: 1 }), p("bulletList", "two")]);
+  assertRoundTrips([p("todoList", "one", { done: false }), p("bulletList", "", { indent: 1 })]);
+});
+
+test("empty bullets that need no placeholder still render bare", () => {
+  assert.equal(assertRoundTrips([p("bulletList", "a"), p("bulletList", ""), p("bulletList", "b")]), "- a\n-\n- b");
+  assert.equal(assertRoundTrips([p("body", ""), p("bulletList", "")]), "\n-");
+  assert.equal(assertRoundTrips([p("bulletList", "a"), p("numberedList", "")]), "- a\n1.");
+});
+
 test("checklists inside blockquotes round-trip", () => {
   const rendered = assertRoundTrips([p("todoList", "quoted todo", { done: false, blockQuoteLevel: 1 })]);
   assert.equal(rendered, "> - [ ] quoted todo");

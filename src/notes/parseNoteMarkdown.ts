@@ -325,12 +325,31 @@ class Parser {
       // doesn't match.
       const itemStartLine = nodeLines(item).start;
       const emptyTodoMatch =
-        checked == null && list.ordered !== true
-          ? /^[ \t>]*[-*+][ \t]+\[([ xX])\][ \t]*$/.exec(this.lines[itemStartLine - 1] ?? "")
-          : null;
-      if (emptyTodoMatch && nodeLines(item).end === itemStartLine) {
+        list.ordered !== true ? /^[ \t>]*[-*+][ \t]+\[([ xX])\][ \t]*$/.exec(this.lines[itemStartLine - 1] ?? "") : null;
+      if (emptyTodoMatch && checked == null && nodeLines(item).end === itemStartLine) {
         const seed: ParagraphSeed = { kind: "todoList", indent, done: emptyTodoMatch[1] !== " ", startNumber: 0 };
         this.record(itemStartLine, makeParagraph("todoList", blockQuoteLevel, "", [], seed));
+        continue;
+      }
+      // GFM also accepts a checkbox followed by a *newline*, so a bare
+      // `- [ ]` line with a body line after it parses as one checked item
+      // whose text is the next (lazily continued) line. The marker line is
+      // the empty todo; the paragraph's lines are Body lines of their own,
+      // at whatever quote depth their raw lines carry.
+      const firstChild = item.children[0];
+      if (emptyTodoMatch && checked != null && firstChild?.type === "paragraph" && nodeLines(firstChild).end > itemStartLine) {
+        const seed: ParagraphSeed = { kind: "todoList", indent, done: checked, startNumber: 0 };
+        this.record(itemStartLine, makeParagraph("todoList", blockQuoteLevel, "", [], seed));
+        const start = { ...firstChild.position!.start, line: itemStartLine + 1 };
+        const rest: Paragraph = { ...firstChild, position: { ...firstChild.position!, start } };
+        this.recordParagraphLines(rest, countQuoteMarkers(this.lines[itemStartLine] ?? ""), BODY_SEED);
+        for (const child of item.children.slice(1)) {
+          if (child.type === "list") {
+            this.walkList(child, blockQuoteLevel, indent + 1);
+          } else {
+            this.degradeBlock(child, blockQuoteLevel);
+          }
+        }
         continue;
       }
 

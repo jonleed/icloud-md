@@ -171,6 +171,38 @@ test("a note in the Trash folder is treated as deleted", () => {
   assert.deepEqual(classifyNoteRecord(record), { status: "deleted" });
 });
 
+test("a list item indented with no parent above it flattens instead of locking the note", () => {
+  // Markdown can only nest an item under another item, so an orphan indent
+  // reads back shallower. That loss is accepted: the note stays editable,
+  // and the file shows the indents markdown can express.
+  const record = makeRecord({
+    TextDataEncrypted: encodeTextField("a\nb\nc", [
+      { length: 2, paragraphStyle: { style: 100, indent: 1 } },
+      { length: 2, paragraphStyle: { style: 100, indent: 2 } },
+      { length: 1, paragraphStyle: { style: 100, indent: 1 } },
+    ]),
+  });
+  const result = classifyNoteRecord(record);
+  assert.equal(result.status, "ok");
+  if (result.status !== "ok") return;
+  assert.equal(result.publishable, true);
+  assert.equal(result.markdownText, "- a\n  - b\n- c");
+});
+
+test("a note that loses more than list indents in the round trip stays read-only", () => {
+  // A list starting at 5 can't interrupt the body line above it.
+  const record = makeRecord({
+    TextDataEncrypted: encodeTextField("x\ny", [
+      { length: 2, paragraphStyle: { style: 3 } },
+      { length: 1, paragraphStyle: { style: 102, startingListItemNumber: 5 } },
+    ]),
+  });
+  const result = classifyNoteRecord(record);
+  assert.equal(result.status, "ok");
+  if (result.status !== "ok") return;
+  assert.equal(result.publishable, false);
+});
+
 test("a note with trailing spaces stays publishable; the rendering trims them", () => {
   // Regression: the round-trip gate once compared the reparse against the
   // raw bodyText, so any device-typed trailing space made the whole note

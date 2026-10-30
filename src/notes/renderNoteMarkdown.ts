@@ -317,7 +317,13 @@ function renderLines(
       while (end < paragraphs.length && isListParagraph(paragraphs[end]!) && paragraphs[end]!.blockQuoteLevel === bq) {
         end += 1;
       }
-      for (const list of buildListNodes(paragraphs.slice(i, end), spelling, literal)) {
+      const previous = paragraphs[i - 1];
+      const afterText =
+        previous !== undefined &&
+        previous.kind !== "monospaced" &&
+        HEADING_DEPTHS[previous.kind] === undefined &&
+        !(previous.kind === "body" && previous.text.length === 0);
+      for (const list of buildListNodes(paragraphs.slice(i, end), spelling, literal, afterText)) {
         pushBlockLines(lines, list, bq);
       }
       i = end;
@@ -393,6 +399,7 @@ function buildListNodes(
   paragraphs: readonly FormatParagraph[],
   spelling: RawSpelling,
   literal: ReadonlySet<FormatParagraph>,
+  afterText: boolean,
 ): List[] {
   const result: List[] = [];
   const stack: { list: List; indent: number }[] = [];
@@ -407,7 +414,9 @@ function buildListNodes(
       stack.pop();
       top = stack[stack.length - 1];
     }
+    let opensList = false;
     if (!top || top.indent < paragraph.indent) {
+      opensList = top !== undefined || (result.length === 0 && afterText);
       const list: List = {
         type: "list",
         ordered,
@@ -433,6 +442,13 @@ function buildListNodes(
     // shape. A real bullet whose text is literally "[ ]" renders escaped
     // (`- \[ ]`), so the two can't collide.
     const emptyTodo = paragraph.kind === "todoList" && paragraph.text.length === 0;
+    // CommonMark won't let an *empty* item interrupt a paragraph: a bare `-`
+    // under a line of text is a setext heading underline, and a bare `1.`
+    // inside an item's text is more of that text. So an empty bullet or
+    // numbered item that opens a list right after text is given a space,
+    // written as a character reference (raw, so it isn't escaped). The
+    // parser trims it back to nothing, like any other trailing whitespace.
+    const placeholder = opensList && !emptyTodo && paragraph.text.length === 0;
     const item: ListItem = {
       type: "listItem",
       spread: false,
@@ -442,7 +458,9 @@ function buildListNodes(
           type: "paragraph",
           children: emptyTodo
             ? [{ type: "html", value: paragraph.done === true ? "[x]" : "[ ]" }]
-            : phrasingFromParagraph(paragraph, spelling, literal.has(paragraph)),
+            : placeholder
+              ? [{ type: "html", value: "&#x20;" }]
+              : phrasingFromParagraph(paragraph, spelling, literal.has(paragraph)),
         },
       ],
     };
