@@ -7,7 +7,7 @@ import { readBaseCopy, writeBaseCopy } from "../notes/baseCopy.js";
 import { writeCloneState, type CloneState } from "../notes/cloneState.js";
 import { localFileState } from "../notes/localFileState.js";
 import { NotClonedDirectoryError, UnboundAccountError } from "../errors.js";
-import { buildPushPlan, moveTitleIntent, planRemoteChangedMerge, runPush, titleKeyIntent } from "./push.js";
+import { buildPushPlan, moveTitleIntent, newFilesInSharedNoteRefusal, planRemoteChangedMerge, runPush, titleKeyIntent } from "./push.js";
 
 async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(tmpdir(), "push-test-"));
@@ -689,6 +689,14 @@ test("buildPushPlan still refuses a new note with an image in a shared folder, l
     assert.equal(entries[0]?.resolution, "refused");
     assert.match(entries[0]?.reason ?? "", /own folders/);
   }));
+
+test("adding a file to an existing note in a shared folder is refused; own notes and file-free edits are not", () => {
+  const reason = newFilesInSharedNoteRefusal("Pat/Shared Recipes/Soup.md", "_owner1", 1);
+  assert.match(reason ?? "", /^Pat\/Shared Recipes\/Soup\.md: files can only be added to notes in your own folders/);
+  assert.match(reason ?? "", /icloud-md restore Pat\/Shared Recipes\/Soup\.md/);
+  assert.equal(newFilesInSharedNoteRefusal("Recipes/Soup.md", undefined, 1), undefined);
+  assert.equal(newFilesInSharedNoteRefusal("Pat/Shared Recipes/Soup.md", "_owner1", 0), undefined);
+});
 
 test("buildPushPlan ignores a file already tracked in state.notes", () =>
   withTempDir(async (dir) => {

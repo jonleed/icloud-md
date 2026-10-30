@@ -1817,6 +1817,11 @@ async function prepareEmbedCandidate(
     summary.refused.push(`${entry.file}: ${plan.reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
     return undefined;
   }
+  const sharedRefusal = newFilesInSharedNoteRefusal(entry.file, entry.sharedZoneOwner, plan.newAttachments.length);
+  if (sharedRefusal !== undefined) {
+    summary.refused.push(sharedRefusal);
+    return undefined;
+  }
   const newAttachments = await resolveNewAttachments(targetDir, entry.file, plan.newAttachments, (reason) => {
     summary.refused.push(`${entry.file}: ${reason}. Run "icloud-md restore ${entry.file}" to discard your local edit.`);
     return undefined;
@@ -2196,6 +2201,23 @@ export function takeAttachmentFiles(
     claimed.add(file);
   }
   return undefined;
+}
+
+/** Why adding `newFileCount` files to an existing note is refused, or
+ * undefined when it isn't. A shared zone's references need the owner's id,
+ * and no shared-folder attachment write has been captured or verified yet. */
+export function newFilesInSharedNoteRefusal(
+  file: string,
+  sharedZoneOwner: string | undefined,
+  newFileCount: number,
+): string | undefined {
+  if (newFileCount === 0 || sharedZoneOwner === undefined) {
+    return undefined;
+  }
+  return (
+    `${file}: files can only be added to notes in your own folders for now. ` +
+    `Run "icloud-md restore ${file}" to discard your local edit.`
+  );
 }
 
 function sharedAttachmentReason(file: string): string {
